@@ -1,0 +1,664 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../../core/components/notification_badge_button.dart';
+import '../../../core/components/app_card.dart';
+import '../../../core/components/app_button.dart';
+import '../../../core/components/status_badge.dart';
+import '../../../core/components/error_state.dart';
+import '../../../core/components/loading_skeleton.dart';
+import '../../../core/theme/app_colors.dart';
+import '../../../core/theme/app_icons.dart';
+import '../../../core/theme/app_spacing.dart';
+import '../../../core/theme/app_text_styles.dart';
+import '../../../core/utils/formatters.dart';
+import '../models/warehouse_order_model.dart';
+import '../models/warehouse_stock_model.dart';
+import '../providers/warehouse_provider.dart';
+import 'warehouse_main_screen.dart';
+import '../../orders/providers/orders_provider.dart';
+import '../../orders/models/order_model.dart';
+import '../../admin/views/create_delivery_trip_dialog.dart';
+
+class WarehouseDashboardScreen extends ConsumerWidget {
+  const WarehouseDashboardScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final dashboardAsync = ref.watch(warehouseDashboardProvider);
+    final readyOrdersAsync = ref.watch(readyOrdersForDeliveryProvider);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: dashboardAsync.when(
+          data: (data) => Text(data.warehouseName, style: AppTextStyles.h2),
+          loading: () => const Text('داشبۆردی کۆگا', style: AppTextStyles.h2),
+          error: (err, stack) => const Text('کۆگا', style: AppTextStyles.h2),
+        ),
+        actions: [
+          const NotificationBadgeButton(),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: () async {
+          ref.invalidate(warehouseDashboardProvider);
+          ref.invalidate(ordersToPackProvider);
+          ref.invalidate(warehouseStocksProvider);
+          ref.invalidate(readyOrdersForDeliveryProvider);
+          await ref.read(warehouseDashboardProvider.future);
+        },
+        child: dashboardAsync.when(
+          loading: () => _buildLoadingState(context),
+          error: (err, stack) => LayoutBuilder(
+            builder: (context, constraints) => SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                child: Center(
+                  child: ErrorState(
+                    title: 'کێشەیەک ڕوویدا لە بارکردنی ئامارەکانی کۆگا',
+                    message: Formatters.cleanError(err),
+                    retryText: 'دووبارە هەوڵبدەرەوە',
+                    onRetry: () => ref.invalidate(warehouseDashboardProvider),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          data: (data) => _buildDashboardContent(context, ref, data, readyOrdersAsync),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLoadingState(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(AppSpacing.screenHorizontal),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          LayoutBuilder(
+            builder: (context, constraints) {
+              int crossAxisCount = 2;
+              if (constraints.maxWidth >= 1024) {
+                crossAxisCount = 4;
+              } else if (constraints.maxWidth >= 600) {
+                crossAxisCount = 3;
+              }
+
+              final childAspectRatio = constraints.maxWidth >= 1024
+                  ? 1.4
+                  : (constraints.maxWidth >= 600 ? 1.25 : 1.08);
+
+              return GridView.count(
+                crossAxisCount: crossAxisCount,
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                crossAxisSpacing: AppSpacing.md,
+                mainAxisSpacing: AppSpacing.md,
+                childAspectRatio: childAspectRatio,
+                children: List.generate(
+                  4,
+                  (index) => const AppCard(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: AppSpacing.md,
+                      vertical: AppSpacing.sm,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        LoadingSkeleton(width: 32, height: 32),
+                        SizedBox(height: 4),
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            LoadingSkeleton(width: 80, height: 14),
+                            SizedBox(height: 4),
+                            LoadingSkeleton(width: 50, height: 22),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+          const SizedBox(height: AppSpacing.lg),
+          const LoadingSkeleton(width: 160, height: 24),
+          const SizedBox(height: AppSpacing.md),
+          const LoadingSkeleton(width: double.infinity, height: 100),
+          const SizedBox(height: AppSpacing.sm),
+          const LoadingSkeleton(width: double.infinity, height: 100),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDashboardContent(
+    BuildContext context,
+    WidgetRef ref,
+    WarehouseDashboardData data,
+    AsyncValue<List<OrderModel>> readyOrdersAsync,
+  ) {
+    final readyOrdersCount = readyOrdersAsync.maybeWhen(
+      data: (orders) => orders.length,
+      orElse: () => 0,
+    );
+
+    return SingleChildScrollView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.all(AppSpacing.screenHorizontal),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          LayoutBuilder(
+            builder: (context, constraints) {
+              int crossAxisCount = 2;
+              if (constraints.maxWidth >= 1024) {
+                crossAxisCount = 4;
+              } else if (constraints.maxWidth >= 600) {
+                crossAxisCount = 3;
+              }
+
+              final childAspectRatio = constraints.maxWidth >= 1024
+                  ? 1.4
+                  : (constraints.maxWidth >= 600 ? 1.25 : 1.08);
+
+              return GridView.count(
+                crossAxisCount: crossAxisCount,
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                crossAxisSpacing: AppSpacing.md,
+                mainAxisSpacing: AppSpacing.md,
+                childAspectRatio: childAspectRatio,
+                children: [
+                  _buildInteractiveStatCard(
+                    context,
+                    title: 'چاوەڕوانی پاکەتکردن',
+                    value: data.pendingPackingCount.toString(),
+                    subtitle: 'داواکاری بۆ ئامادەکردن',
+                    icon: AppIcons.orderStatus,
+                    color: AppColors.warning,
+                    onTap: () {
+                      ref.read(warehouseTabIndexProvider.notifier).state = 1;
+                    },
+                  ),
+                  _buildInteractiveStatCard(
+                    context,
+                    title: 'ئامادەکراوی ئەمڕۆ',
+                    value: data.readyTodayCount.toString(),
+                    subtitle: 'پسوڵەی تەواوکراو',
+                    icon: AppIcons.orderDelivered,
+                    color: AppColors.success,
+                    onTap: null,
+                  ),
+                  _buildInteractiveStatCard(
+                    context,
+                    title: 'ئامادەکراوی دەرەوەی گەشت',
+                    value: readyOrdersCount.toString(),
+                    subtitle: 'پسوڵەی بێ گەشت',
+                    icon: Icons.local_shipping_outlined,
+                    color: AppColors.primary,
+                    isAlert: readyOrdersCount > 0,
+                    isDimmed: readyOrdersCount == 0,
+                    onTap: readyOrdersCount > 0
+                        ? () {
+                            final orderIds = readyOrdersAsync.maybeWhen(
+                              data: (orders) => orders.map((o) => o.id).toList(),
+                              orElse: () => <int>[],
+                            );
+                            showDialog(
+                              context: context,
+                              barrierDismissible: false,
+                              builder: (context) => CreateDeliveryTripDialog(
+                                initialSelectedOrderIds: orderIds,
+                              ),
+                            );
+                          }
+                        : null,
+                  ),
+                  _buildInteractiveStatCard(
+                    context,
+                    title: 'کاڵای کەمبوو',
+                    value: data.lowStockCount.toString(),
+                    subtitle: 'لەژێر ئاستی کەمینە',
+                    icon: Icons.warning_amber_rounded,
+                    color: AppColors.danger,
+                    isAlert: data.lowStockCount > 0,
+                    isDimmed: data.lowStockCount == 0,
+                    onTap: () {
+                      ref.read(warehouseLowStockFilterProvider.notifier).state =
+                          true;
+                      ref.read(warehouseTabIndexProvider.notifier).state = 2;
+                    },
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: AppSpacing.lg),
+          _buildQuickActionsRow(context, ref, data),
+          const SizedBox(height: AppSpacing.lg),
+          _buildPendingOrdersSection(context, ref, data.recentOrders),
+          if (data.lowStockItems.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.lg),
+            _buildLowStockSection(context, ref, data.lowStockItems),
+          ],
+          const SizedBox(height: AppSpacing.xl),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInteractiveStatCard(
+    BuildContext context, {
+    required String title,
+    required String value,
+    required String subtitle,
+    required IconData icon,
+    required Color color,
+    VoidCallback? onTap,
+    bool isAlert = false,
+    bool isDimmed = false,
+  }) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final adaptiveColor = AppColors.getAdaptiveColor(context, color);
+    final dangerColor = isDark ? AppColors.dangerDark : AppColors.danger;
+    
+    // Dimmed state colors (slate/grey scale to look "turned off")
+    final Color dimmedColor = isDark ? const Color(0xFF64748B) : const Color(0xFF94A3B8);
+    
+    final cardBgColor = isAlert 
+        ? dangerColor.withValues(alpha: isDark ? 0.12 : 0.06) 
+        : (isDimmed 
+            ? (isDark ? const Color(0xFF1E293B).withValues(alpha: 0.6) : const Color(0xFFF8FAFC))
+            : null);
+        
+    final cardBorderColor = isAlert 
+        ? dangerColor.withValues(alpha: 0.6) 
+        : (isDimmed 
+            ? (isDark ? const Color(0xFF334155).withValues(alpha: 0.4) : const Color(0xFFE2E8F0))
+            : null);
+
+    return AppCard(
+      onTap: onTap,
+      color: cardBgColor,
+      borderColor: cardBorderColor,
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.md,
+        vertical: AppSpacing.sm,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(AppSpacing.xs),
+                decoration: BoxDecoration(
+                  color: isAlert 
+                      ? dangerColor.withValues(alpha: 0.25)
+                      : (isDimmed 
+                          ? (isDark ? const Color(0xFF334155).withValues(alpha: 0.5) : const Color(0xFFE2E8F0))
+                          : adaptiveColor.withValues(alpha: 0.12)),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: isAlert
+                    ? Icon(
+                        Icons.warning_amber_rounded,
+                        color: dangerColor,
+                        size: 22,
+                      )
+                    : Icon(icon, color: isDimmed ? dimmedColor : adaptiveColor, size: 22),
+              ),
+              if (onTap != null)
+                Icon(
+                  Icons.arrow_forward_ios_rounded,
+                  size: 14,
+                  color: isAlert 
+                      ? dangerColor
+                      : (isDimmed ? dimmedColor : Theme.of(context).colorScheme.onSurfaceVariant),
+                ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                title,
+                style: AppTextStyles.caption.copyWith(
+                  color: isAlert ? AppColors.danger : (isDimmed ? dimmedColor : null),
+                  fontWeight: isAlert ? FontWeight.bold : null,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 2),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Text(
+                    value,
+                    style: AppTextStyles.h2.copyWith(
+                      color: isAlert ? AppColors.danger : (isDimmed ? dimmedColor : null),
+                    ),
+                    maxLines: 1,
+                  ),
+                  if (isAlert) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: AppColors.danger,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Text(
+                        'ئاگاداری',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 9,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 2),
+              Text(
+                subtitle,
+                style: AppTextStyles.caption.copyWith(
+                  color: isAlert 
+                      ? AppColors.danger.withValues(alpha: 0.8)
+                      : (isDimmed ? dimmedColor.withValues(alpha: 0.7) : Theme.of(context).colorScheme.onSurfaceVariant),
+                  fontSize: 11,
+                  fontWeight: isAlert ? FontWeight.w500 : null,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildQuickActionsRow(
+    BuildContext context,
+    WidgetRef ref,
+    WarehouseDashboardData data,
+  ) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isCompact = constraints.maxWidth < 400;
+        final packingText = isCompact
+            ? 'پاکەتکردن (${data.pendingPackingCount})'
+            : 'پاکەتکردنی پسوڵەکان (${data.pendingPackingCount})';
+
+        return Row(
+          children: [
+            Expanded(
+              child: AppButton(
+                text: packingText,
+                icon: AppIcons.orderStatus,
+                onPressed: () {
+                  ref.read(warehouseTabIndexProvider.notifier).state = 1;
+                },
+              ),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            Expanded(
+              child: AppButton(
+                text: 'پشکنینی ستۆک',
+                icon: Icons.inventory_2_outlined,
+                type: AppButtonType.outline,
+                onPressed: () {
+                  ref.read(warehouseLowStockFilterProvider.notifier).state = false;
+                  ref.read(warehouseTabIndexProvider.notifier).state = 2;
+                },
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildPendingOrdersSection(
+    BuildContext context,
+    WidgetRef ref,
+    List<WarehouseOrderModel> orders,
+  ) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Expanded(
+              child: const Text(
+                'پسوڵەکانی چاوەڕوانی پاکەتکردن',
+                style: AppTextStyles.h3,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (orders.isNotEmpty)
+              TextButton.icon(
+                onPressed: () {
+                  ref.read(warehouseTabIndexProvider.notifier).state = 1;
+                },
+                icon: const Icon(Icons.arrow_forward, size: 16),
+                label: const Text('بینینی هەمووی'),
+              ),
+          ],
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        if (orders.isEmpty)
+          AppCard(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: AppSpacing.lg),
+              child: Center(
+                child: Column(
+                  children: [
+                    const Icon(
+                      Icons.check_circle_outline_rounded,
+                      size: 40,
+                      color: AppColors.success,
+                    ),
+                    const SizedBox(height: AppSpacing.sm),
+                    const Text(
+                      'هیچ پسوڵەیەک لە چاوەڕوانیدا نییە',
+                      style: AppTextStyles.bodyBold,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'هەموو پسوڵەکان پاکەت کراون و ئامادەن.',
+                      style: AppTextStyles.caption.copyWith(
+                        color: AppColors.textSecondaryLight,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          )
+        else
+          ListView.separated(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            itemCount: orders.length,
+            separatorBuilder: (context, index) => const SizedBox(height: AppSpacing.sm),
+            itemBuilder: (context, index) {
+              final order = orders[index];
+              return AppCard(
+                onTap: () {
+                  context.push('/pack-order/${order.id}');
+                },
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Wrap(
+                            spacing: AppSpacing.sm,
+                            runSpacing: AppSpacing.xs,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            children: [
+                              Text(
+                                'پسوڵەی ${order.customerName}',
+                                style: AppTextStyles.bodyBold,
+                              ),
+                              StatusBadge(
+                                label: order.status == 'PACKING'
+                                    ? 'لە پاکەتکردندایە'
+                                    : 'پشتڕاستکراوە',
+                                type: order.status == 'PACKING'
+                                    ? StatusBadgeType.warning
+                                    : StatusBadgeType.info,
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'مەندوب: ${order.salesmanName}',
+                            style: AppTextStyles.bodySmall.copyWith(
+                              color: AppColors.textSecondaryLight,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'ژمارەی کاڵا: ${order.items.length} دانە • بەروار: ${Formatters.kurdishDayAndDate(order.createdAt)}',
+                            style: AppTextStyles.caption.copyWith(
+                              color: AppColors.textSecondaryLight,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
+                      onPressed: () {
+                        context.push('/pack-order/${order.id}');
+                      },
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+      ],
+    );
+  }
+
+  Widget _buildLowStockSection(
+    BuildContext context,
+    WidgetRef ref,
+    List<WarehouseStockModel> lowStockItems,
+  ) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Expanded(
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.warning_amber_rounded,
+                    color: AppColors.danger,
+                    size: 20,
+                  ),
+                  const SizedBox(width: AppSpacing.xs),
+                  Expanded(
+                    child: Text(
+                      'ئاگاداری کاڵا کەمبووەکان',
+                      style: AppTextStyles.h3,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            TextButton(
+              onPressed: () {
+                ref.read(warehouseLowStockFilterProvider.notifier).state = true;
+                ref.read(warehouseTabIndexProvider.notifier).state = 2;
+              },
+              child: const Text('بینینی لە ستۆک'),
+            ),
+          ],
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        ListView.separated(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: lowStockItems.length,
+          separatorBuilder: (context, index) => const SizedBox(height: AppSpacing.xs),
+          itemBuilder: (context, index) {
+            final stock = lowStockItems[index];
+            return AppCard(
+              onTap: () {
+                ref.read(warehouseLowStockFilterProvider.notifier).state = true;
+                ref.read(warehouseTabIndexProvider.notifier).state = 2;
+              },
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          stock.productName,
+                          style: AppTextStyles.bodyBold,
+                        ),
+                        if (stock.barcode.isNotEmpty)
+                          Text(
+                            'باڕکۆد: ${stock.barcode}',
+                            style: AppTextStyles.caption.copyWith(
+                              color: AppColors.textSecondaryLight,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text(
+                        'مەوجوود: ${stock.quantity}',
+                        style: AppTextStyles.bodyBold.copyWith(
+                          color: AppColors.danger,
+                        ),
+                      ),
+                      Text(
+                        'ئاستی کەمینە: ${stock.minStockLevel}',
+                        style: AppTextStyles.caption.copyWith(
+                          color: AppColors.textSecondaryLight,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+}

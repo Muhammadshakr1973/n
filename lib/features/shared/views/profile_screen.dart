@@ -1,0 +1,112 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../../core/components/app_button.dart';
+import '../../../core/components/app_card.dart';
+import '../../../core/components/customer_avatar.dart';
+import '../../../core/theme/app_icons.dart';
+import '../../../core/theme/app_spacing.dart';
+import '../../../core/theme/app_text_styles.dart';
+import '../../../core/theme/theme_provider.dart';
+import '../../auth/providers/auth_provider.dart';
+
+class ProfileScreen extends ConsumerWidget {
+  const ProfileScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final user = ref.watch(authProvider).user;
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('پڕۆفایل', style: AppTextStyles.h2)),
+      body: ListView(
+        padding: const EdgeInsets.all(AppSpacing.screenHorizontal),
+        children: [
+          Center(
+            child: Column(
+              children: [
+                CustomerAvatar(
+                  imageUrl: user?.imageUrl,
+                  size: 100,
+                  borderRadius: 32,
+                  placeholderIcon: AppIcons.profile,
+                  backgroundColor: theme.colorScheme.primaryContainer,
+                  iconColor: theme.colorScheme.primary,
+                  iconSize: 50,
+                ),
+                const SizedBox(height: AppSpacing.md),
+                Text(user?.name ?? 'ناوی بەکارهێنەر', style: AppTextStyles.h2),
+                Text(
+                  user?.role.toUpperCase() ?? 'ROLE',
+                  style: AppTextStyles.bodyMedium.copyWith(
+                    color: theme.colorScheme.primary,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  user?.phone ?? '0750 000 0000',
+                  style: AppTextStyles.caption,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: AppSpacing.sectionGap),
+          const Text('ڕێکخستنەکان', style: AppTextStyles.h3),
+          const SizedBox(height: AppSpacing.md),
+          AppCard(
+            child: Column(
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.language),
+                  title: const Text('زمان', style: AppTextStyles.bodyBold),
+                  trailing: const Text(
+                    'کوردی (سۆرانی)',
+                    style: AppTextStyles.caption,
+                  ),
+                  onTap: () {},
+                ),
+                const Divider(),
+                ListTile(
+                  leading: const Icon(Icons.dark_mode_outlined),
+                  title: const Text(
+                    'دۆخی تاریک',
+                    style: AppTextStyles.bodyBold,
+                  ),
+                  trailing: Switch(
+                    value: ref.watch(themeModeProvider) == ThemeMode.dark,
+                    onChanged: (val) {
+                      ref.read(themeModeProvider.notifier).toggleTheme();
+                    },
+                  ),
+                ),
+                const Divider(),
+                ListTile(
+                  leading: const Icon(Icons.lock_outline),
+                  title: const Text(
+                    'گۆڕینی وشەی نهێنی',
+                    style: AppTextStyles.bodyBold,
+                  ),
+                  trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                  onTap: () {},
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: AppSpacing.sectionGap),
+          AppButton(
+            text: 'چوونەدەرەوە',
+            icon: Icons.logout_rounded,
+            type: AppButtonType.danger,
+            onPressed: () {
+              ref.read(authProvider.notifier).logout();
+              context.go('/login');
+            },
+            size: AppButtonSize.lg,
+          ),
+        ],
+      ),
+    );
+  }
+}

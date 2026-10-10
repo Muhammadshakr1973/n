@@ -1,0 +1,228 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Models\User;
+use App\Models\Role;
+use App\Models\Customer;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Tests\TestCase;
+
+class CustomerTest extends TestCase
+{
+    use RefreshDatabase;
+
+    protected $admin;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $role = Role::firstOrCreate(['name' => 'admin'], ['display_name' => 'Admin']);
+        $this->admin = User::factory()->create(['role_id' => $role->id, 'is_active' => true]);
+    }
+
+    /** @test */
+    public function it_can_create_a_customer()
+    {
+        $payload = [
+            'name' => 'Test Customer',
+            'phone' => '07501234567',
+            'price_tier' => 'RETAIL'
+        ];
+
+        $response = $this->actingAs($this->admin)->postJson('/api/v1/customers', $payload);
+
+        $response->assertStatus(201);
+        $this->assertDatabaseHas('customers', ['name' => 'Test Customer']);
+    }
+
+    /** @test */
+    public function it_can_update_a_customer()
+    {
+        $customer = Customer::create([
+            'name' => 'Old Name',
+            'phone' => '07501112233',
+            'price_tier' => 'RETAIL'
+        ]);
+
+        $response = $this->actingAs($this->admin)->putJson('/api/v1/customers/' . $customer->id, [
+            'name' => 'New Name',
+            'price_tier' => 'WHOLESALE'
+        ]);
+
+        $response->assertStatus(200);
+        $this->assertDatabaseHas('customers', ['name' => 'New Name', 'price_tier' => 'WHOLESALE']);
+    }
+
+    /** @test */
+    public function create_customer_is_idempotent_with_same_key()
+    {
+        $idempotencyKey = 'cust-create-key-123';
+        $payload = [
+            'name' => 'Idempotent Customer',
+            'phone' => '07509998877',
+            'price_tier' => 'RETAIL'
+        ];
+
+        // First attempt
+        $res1 = $this->actingAs($this->admin)
+            ->withHeader('X-Idempotency-Key', $idempotencyKey)
+            ->postJson('/api/v1/customers', $payload);
+
+        $res1->assertStatus(201);
+        $customerId = $res1->json('data.id');
+
+        // Retry attempt with SAME key
+        $res2 = $this->actingAs($this->admin)
+            ->withHeader('X-Idempotency-Key', $idempotencyKey)
+            ->postJson('/api/v1/customers', $payload);
+
+        $res2->assertStatus(201);
+        $res2->assertHeader('X-Cache-Lookup', 'HIT');
+        $res2->assertJsonPath('data.id', $customerId);
+
+        // Ensure exactly ONE customer record exists in DB
+        $this->assertEquals(1, Customer::where('phone', '07509998877')->count());
+    }
+
+    /** @test */
+    public function update_customer_is_idempotent_with_same_key()
+    {
+        $customer = Customer::create([
+            'name' => 'Original Name',
+            'phone' => '07505554433',
+            'price_tier' => 'RETAIL'
+        ]);
+
+        $idempotencyKey = 'cust-update-key-456';
+        $payload = [
+            'name' => 'Updated Idempotent Name',
+            'price_tier' => 'WHOLESALE'
+        ];
+
+        // First attempt
+        $res1 = $this->actingAs($this->admin)
+            ->withHeader('X-Idempotency-Key', $idempotencyKey)
+            ->putJson('/api/v1/customers/' . $customer->id, $payload);
+
+        $res1->assertStatus(200);
+
+        // Retry attempt with SAME key
+        $res2 = $this->actingAs($this->admin)
+            ->withHeader('X-Idempotency-Key', $idempotencyKey)
+            ->putJson('/api/v1/customers/' . $customer->id, $payload);
+
+        $res2->assertStatus(200);
+        $res2->assertHeader('X-Cache-Lookup', 'HIT');
+    }
+
+    /** @test */
+    public function it_can_view_customer_ledger()
+    {
+        $customer = Customer::create([
+            'name' => 'Ledger Customer',
+            'phone' => '07507778899',
+            'current_balance' => 50000,
+        ]);
+
+        $customer->ledger()->create([
+            'entry_type' => 'SALE',
+            'type' => 'debit',
+            'debit' => 50000,
+            'credit' => 0,
+            'amount' => 50000,
+            'balance_before' => 0,
+            'balance_after' => 50000,
+            'description' => 'Test invoice debit',
+            'created_by' => $this->admin->id,
+        ]);
+
+        $response = $this->actingAs($this->admin)->getJson('/api/v1/customers/' . $customer->id . '/ledger');
+
+        $response->assertStatus(200);
+        $response->assertJsonStructure([
+            'message',
+            'data' => [
+                '*' => [
+                    'id',
+                    'customer_id',
+                    'entry_type',
+                    'debit',
+                    'credit',
+                    'amount',
+                    'balance_before',
+                    'balance_after',
+                ]
+            ]
+        ]);
+        $this->assertCount(1, $response->json('data'));
+    }
+
+    /** @test */
+    public function it_can_create_a_customer_with_image_url()
+    {
+        $payload = [
+            'name' => 'Customer With Image',
+            'phone' => '07507654321',
+            'price_tier' => 'RETAIL',
+            'image_url' => 'https://example.com/customer.jpg'
+        ];
+
+        $response = $this->actingAs($this->admin)->postJson('/api/v1/customers', $payload);
+
+        $response->assertStatus(201);
+        $this->assertDatabaseHas('customers', [
+            'name' => 'Customer With Image',
+            'image_url' => 'https://example.com/customer.jpg',
+        ]);
+    }
+
+    /** @test */
+    public function it_can_manage_customer_special_prices()
+    {
+        $customer = Customer::create([
+            'name' => 'Special Price Customer',
+            'phone' => '07509998877',
+            'price_type' => 'N2',
+            'current_balance' => 0,
+        ]);
+
+        $product = \App\Models\Product::create([
+            'name' => 'Special Prod',
+            'sku' => 'SP-01',
+            'cost_price' => 2000,
+            'price_n1' => 4000,
+            'price_n2' => 3500,
+            'price_n3' => 3000,
+        ]);
+
+        // 1. Set special price
+        $setResponse = $this->actingAs($this->admin)->postJson("/api/v1/customers/{$customer->id}/special-prices", [
+            'product_id' => $product->id,
+            'price' => 2800,
+        ]);
+        $setResponse->assertStatus(200);
+        $this->assertDatabaseHas('customer_special_prices', [
+            'customer_id' => $customer->id,
+            'product_id' => $product->id,
+            'price' => 2800,
+        ]);
+
+        // 2. Get special prices
+        $getResponse = $this->actingAs($this->admin)->getJson("/api/v1/customers/{$customer->id}/special-prices");
+        $getResponse->assertStatus(200);
+        $getResponse->assertJsonFragment([
+            'product_id' => $product->id,
+            'price' => 2800,
+        ]);
+
+        // 3. Delete special price
+        $delResponse = $this->actingAs($this->admin)->deleteJson("/api/v1/customers/{$customer->id}/special-prices/{$product->id}");
+        $delResponse->assertStatus(200);
+        $this->assertDatabaseMissing('customer_special_prices', [
+            'customer_id' => $customer->id,
+            'product_id' => $product->id,
+        ]);
+    }
+}
+

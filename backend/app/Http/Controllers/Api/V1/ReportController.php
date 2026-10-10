@@ -1,0 +1,338 @@
+<?php
+
+namespace App\Http\Controllers\Api\V1;
+
+use App\Http\Controllers\Controller;
+use App\Models\Customer;
+use App\Models\CustomerPayment;
+use App\Models\SalesOrder;
+use App\Services\ReportService;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
+
+class ReportController extends Controller
+{
+    public function __construct(
+        protected ReportService $reportService
+    ) {}
+
+    /**
+     * Dashboard KPI summary
+     */
+    public function dashboard(): JsonResponse
+    {
+        $cacheKey = 'admin_dashboard_kpis_v4';
+
+        $data = Cache::remember($cacheKey, 60, function () {
+            $startOfMonth = Carbon::now()->startOfMonth();
+            $endOfMonth = Carbon::now()->endOfMonth();
+
+            $startOfLastMonth = Carbon::now()->subMonth()->startOfMonth();
+            $endOfLastMonth = Carbon::now()->subMonth()->endOfMonth();
+
+            // 1. Monthly sales from confirmed/delivered orders using authoritative order_date
+            $monthlySales = (int) SalesOrder::whereIn('status', [SalesOrder::STATUS_DELIVERED, SalesOrder::STATUS_CONFIRMED, 'delivered', 'confirmed'])
+                ->whereBetween('order_date', [$startOfMonth->toDateString(), $endOfMonth->toDateString()])
+                ->sum('total_amount');
+
+            // 2. Monthly profit using authoritative order_date
+            $monthlyProfit = (int) SalesOrder::whereIn('status', [SalesOrder::STATUS_DELIVERED, SalesOrder::STATUS_CONFIRMED, 'delivered', 'confirmed'])
+                ->whereBetween('order_date', [$startOfMonth->toDateString(), $endOfMonth->toDateString()])
+                ->sum('total_profit');
+
+            // 3. Last month's sales
+            $lastMonthSales = (int) SalesOrder::whereIn('status', [SalesOrder::STATUS_DELIVERED, SalesOrder::STATUS_CONFIRMED, 'delivered', 'confirmed'])
+                ->whereBetween('order_date', [$startOfLastMonth->toDateString(), $endOfLastMonth->toDateString()])
+                ->sum('total_amount');
+
+            // 4. Last month's profit
+            $lastMonthProfit = (int) SalesOrder::whereIn('status', [SalesOrder::STATUS_DELIVERED, SalesOrder::STATUS_CONFIRMED, 'delivered', 'confirmed'])
+                ->whereBetween('order_date', [$startOfLastMonth->toDateString(), $endOfLastMonth->toDateString()])
+                ->sum('total_profit');
+
+            // 5. Outstanding customer receivables / customer debts
+            $totalReceivables = (int) Customer::sum('current_balance');
+
+            // 5b. Outstanding supplier payables
+            $totalPayables = (int) \App\Models\Supplier::sum('current_balance');
+
+            // 6. Monthly collections
+            $monthlyCollected = (int) CustomerPayment::whereBetween('paid_at', [$startOfMonth->toDateString(), $endOfMonth->toDateString()])
+                ->sum('amount');
+
+            // 7. Delivered to office (collections handed over to office)
+            $deliveredToOffice = (int) \App\Models\DriverCollection::whereBetween('collected_at', [$startOfMonth->toDateString(), $endOfMonth->toDateString()])
+                ->sum('amount');
+
+            // 8. Total remaining cash with all drivers
+            $totalCollectedByDrivers = (int) \DB::table('delivery_trip_orders')
+                ->where('status', 'DELIVERED')
+                ->sum('received_amount');
+            $totalPaidByDrivers = (int) \DB::table('driver_collections')->sum('amount');
+            $driversRemainingCash = $totalCollectedByDrivers - $totalPaidByDrivers;
+
+            // 9. Get the last collection from any driver
+            $lastCollection = \App\Models\DriverCollection::with('driver:id,name')
+                ->orderBy('id', 'desc')
+                ->first();
+            $lastCollectionAmount = $lastCollection ? (int)$lastCollection->amount : 0;
+            $lastCollectionDriverName = $lastCollection && $lastCollection->driver ? $lastCollection->driver->name : null;
+
+            return [
+                'monthly_sales'            => $monthlySales,
+                'monthly_profit'           => $monthlyProfit,
+                'last_month_sales'         => $lastMonthSales,
+                'last_month_profit'        => $lastMonthProfit,
+                'total_receivables'        => $totalReceivables,
+                'total_customer_debts'     => $totalReceivables,
+                'total_payables'           => $totalPayables,
+                'monthly_collected'        => $monthlyCollected,
+                'delivered_to_office'      => $deliveredToOffice,
+                'drivers_remaining_cash'   => $driversRemainingCash,
+                'last_collection_amount'   => $lastCollectionAmount,
+                'last_collection_driver'   => $lastCollectionDriverName,
+            ];
+        });
+
+        return response()->json([
+            'message' => 'ئامارەکانی داشبۆرد',
+            'data' => $data
+        ], 200);
+    }
+
+    /**
+     * Sales Report (ڕاپۆرتی فرۆشتن)
+     */
+    public function sales(Request $request): JsonResponse
+    {
+        $filters = $request->only([
+            'start_date',
+            'end_date',
+            'customer_id',
+            'salesman_id',
+            'route_id',
+            'warehouse_id',
+            'status',
+            'price_tier',
+            'per_page',
+            'page',
+        ]);
+
+        $report = $this->reportService->getSalesReport($filters);
+
+        return response()->json([
+            'message' => 'ڕاپۆرتی فرۆشتن',
+            'data'    => $report,
+        ], 200);
+    }
+
+    /**
+     * Profit Report (ڕاپۆرتی قازانج)
+     */
+    public function profit(Request $request): JsonResponse
+    {
+        $filters = $request->only([
+            'start_date',
+            'end_date',
+            'customer_id',
+            'salesman_id',
+            'route_id',
+            'warehouse_id',
+            'product_id',
+            'category_id',
+            'per_page',
+            'page',
+        ]);
+
+        $report = $this->reportService->getProfitReport($filters);
+
+        return response()->json([
+            'message' => 'ڕاپۆرتی قازانج',
+            'data'    => $report,
+        ], 200);
+    }
+
+    /**
+     * Sales by Salesman (فرۆشتن بەپێی مەندوب)
+     */
+    public function salesBySalesman(Request $request): JsonResponse
+    {
+        $filters = $request->only([
+            'start_date',
+            'end_date',
+            'salesman_id',
+            'warehouse_id',
+        ]);
+
+        $report = $this->reportService->getSalesBySalesmanReport($filters);
+
+        return response()->json([
+            'message' => 'ڕاپۆرتی فرۆشتن بەپێی مەندوب',
+            'data'    => $report,
+        ], 200);
+    }
+
+    /**
+     * Customer Debts Report (قەرزی کڕیارەکان)
+     */
+    public function customerDebts(Request $request): JsonResponse
+    {
+        $filters = $request->only([
+            'customer_id',
+            'route_id',
+            'start_date',
+            'end_date',
+            'entry_type',
+            'has_debt_only',
+            'per_page',
+            'page',
+        ]);
+
+        $report = $this->reportService->getCustomerDebtsReport($filters);
+
+        return response()->json([
+            'message' => 'ڕاپۆرتی قەرزی کڕیارەکان',
+            'summary' => $report['summary'],
+            'data'    => $report['ledgers'] instanceof \Illuminate\Contracts\Pagination\LengthAwarePaginator
+                ? $report['ledgers']->items()
+                : $report['ledgers'],
+            'pagination' => $report['ledgers'] instanceof \Illuminate\Contracts\Pagination\LengthAwarePaginator ? [
+                'current_page' => $report['ledgers']->currentPage(),
+                'last_page'    => $report['ledgers']->lastPage(),
+                'per_page'     => $report['ledgers']->perPage(),
+                'total'        => $report['ledgers']->total(),
+            ] : null,
+        ], 200);
+    }
+
+    /**
+     * Supplier Debts Report (قەرزی کۆمپانیاکان)
+     */
+    public function supplierDebts(Request $request): JsonResponse
+    {
+        $filters = $request->only([
+            'supplier_id',
+            'start_date',
+            'end_date',
+            'entry_type',
+            'has_debt_only',
+            'per_page',
+            'page',
+        ]);
+
+        $report = $this->reportService->getSupplierDebtsReport($filters);
+
+        return response()->json([
+            'message' => 'ڕاپۆرتی قەرزی کۆمپانیاکان',
+            'summary' => $report['summary'],
+            'data'    => $report['ledgers'] instanceof \Illuminate\Contracts\Pagination\LengthAwarePaginator
+                ? $report['ledgers']->items()
+                : $report['ledgers'],
+            'pagination' => $report['ledgers'] instanceof \Illuminate\Contracts\Pagination\LengthAwarePaginator ? [
+                'current_page' => $report['ledgers']->currentPage(),
+                'last_page'    => $report['ledgers']->lastPage(),
+                'per_page'     => $report['ledgers']->perPage(),
+                'total'        => $report['ledgers']->total(),
+            ] : null,
+        ], 200);
+    }
+
+    /**
+     * Payments History Report (مێژووی پارەدان)
+     */
+    public function paymentsHistory(Request $request): JsonResponse
+    {
+        $filters = $request->only([
+            'type',
+            'customer_id',
+            'supplier_id',
+            'salesman_id',
+            'payment_method',
+            'start_date',
+            'end_date',
+            'per_page',
+            'page',
+        ]);
+
+        $report = $this->reportService->getPaymentsHistoryReport($filters);
+
+        return response()->json([
+            'message' => 'ڕاپۆرتی مێژووی پارەدان',
+            'summary' => $report['summary'],
+            'data'    => $report['payments']->items(),
+            'pagination' => [
+                'current_page' => $report['payments']->currentPage(),
+                'last_page'    => $report['payments']->lastPage(),
+                'per_page'     => $report['payments']->perPage(),
+                'total'        => $report['payments']->total(),
+            ],
+        ], 200);
+    }
+
+    /**
+     * Low Stock Report (کاڵا کەمبووەکان)
+     */
+    public function lowStock(Request $request): JsonResponse
+    {
+        $filters = $request->only([
+            'warehouse_id',
+            'category_id',
+            'supplier_id',
+        ]);
+
+        $report = $this->reportService->getLowStockReport($filters);
+
+        return response()->json([
+            'message' => 'ڕاپۆرتی کاڵا کەمبووەکان',
+            'data'    => $report,
+        ], 200);
+    }
+
+    /**
+     * Stock Movements Report (جوڵەی ستۆک)
+     */
+    public function stockMovements(Request $request): JsonResponse
+    {
+        $filters = $request->only([
+            'warehouse_id',
+            'product_id',
+            'type',
+            'start_date',
+            'end_date',
+            'per_page',
+            'page',
+        ]);
+
+        $report = $this->reportService->getStockMovementsReport($filters);
+
+        return response()->json([
+            'message' => 'ڕاپۆرتی جوڵەی ستۆک',
+            'data'    => $report,
+        ], 200);
+    }
+
+    /**
+     * Stock Transfers Report (گواستنەوەی کۆگاکان)
+     */
+    public function stockTransfers(Request $request): JsonResponse
+    {
+        $filters = $request->only([
+            'from_warehouse_id',
+            'to_warehouse_id',
+            'status',
+            'start_date',
+            'end_date',
+            'per_page',
+            'page',
+        ]);
+
+        $report = $this->reportService->getStockTransfersReport($filters);
+
+        return response()->json([
+            'message' => 'ڕاپۆرتی گواستنەوەی کۆگاکان',
+            'data'    => $report,
+        ], 200);
+    }
+}

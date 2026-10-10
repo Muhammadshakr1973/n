@@ -1,0 +1,215 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../core/api_client.dart';
+import '../../auth/providers/auth_provider.dart';
+import '../models/route_model.dart';
+import 'customer_provider.dart';
+
+List<Map<String, dynamic>> _parseListResponse(dynamic rawData) {
+  if (rawData is List) {
+    return List<Map<String, dynamic>>.from(rawData);
+  }
+  if (rawData is Map) {
+    if (rawData.containsKey('data')) {
+      final inner = rawData['data'];
+      if (inner is List) {
+        return List<Map<String, dynamic>>.from(inner);
+      }
+      if (inner is Map && inner.containsKey('data')) {
+        final doubleInner = inner['data'];
+        if (doubleInner is List) {
+          return List<Map<String, dynamic>>.from(doubleInner);
+        }
+      }
+    }
+  }
+  throw FormatException('داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed response structure)');
+}
+
+final routeListProvider = FutureProvider<List<RouteModel>>((ref) async {
+  final userId = ref.watch(authProvider.select((state) => state.user?.id));
+  if (userId == null) return const [];
+  final api = ref.watch(apiClientProvider);
+  try {
+    final response = await api.client.get('/routes');
+    if (response.statusCode == 200) {
+      final list = _parseListResponse(response.data);
+      return list.map((json) => RouteModel.fromJson(json)).toList();
+    }
+    throw Exception(
+      'سێرڤەر کۆدی نادروستی گەڕاندەوە (Server returned invalid code): ${response.statusCode}',
+    );
+  } catch (e) {
+    throw Exception(api.parseError(e));
+  }
+});
+
+final routeActionsProvider = Provider<RouteActions>((ref) {
+  final api = ref.watch(apiClientProvider);
+  return RouteActions(api, ref);
+});
+
+class RouteActions {
+  final ApiClient api;
+  final Ref ref;
+
+  RouteActions(this.api, this.ref);
+
+  Future<RouteModel> addRoute({
+    required String name,
+    String? color,
+    bool isActive = true,
+  }) async {
+    try {
+      final response = await api.client.post(
+        '/routes',
+        data: {
+          'name': name,
+          if (color != null) 'color': color,
+          'is_active': isActive,
+        },
+      );
+      if (response.statusCode != 200 && response.statusCode != 201) {
+        throw response.data ?? 'هەڵەیەک ڕوویدا';
+      }
+      ref.invalidate(routeListProvider);
+      final resData = response.data;
+      if (resData is! Map || resData['data'] is! Map) {
+        throw FormatException(
+          'داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed route response payload)',
+        );
+      }
+      return RouteModel.fromJson(Map<String, dynamic>.from(resData['data']));
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<RouteModel> updateRoute(
+    int id, {
+    required String name,
+    String? color,
+    bool? isActive,
+  }) async {
+    try {
+      final response = await api.client.put(
+        '/routes/$id',
+        data: {
+          'name': name,
+          if (color != null) 'color': color,
+          if (isActive != null) 'is_active': isActive,
+        },
+      );
+      if (response.statusCode != 200 && response.statusCode != 201) {
+        throw response.data ?? 'هەڵەیەک ڕوویدا';
+      }
+      ref.invalidate(routeListProvider);
+      final resData = response.data;
+      if (resData is! Map || resData['data'] is! Map) {
+        throw FormatException(
+          'داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed route response payload)',
+        );
+      }
+      return RouteModel.fromJson(Map<String, dynamic>.from(resData['data']));
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<void> deleteRoute(int id) async {
+    try {
+      await api.client.delete('/routes/$id');
+      ref.invalidate(routeListProvider);
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<void> assignSalesman(
+    int routeId,
+    int salesmanId, {
+    String? workDate,
+    String? dayOfWeek,
+  }) async {
+    try {
+      await api.client.post(
+        '/routes/$routeId/assign-salesman',
+        data: {
+          'salesman_id': salesmanId,
+          if (workDate != null) 'work_date': workDate,
+          if (dayOfWeek != null) 'day_of_week': dayOfWeek,
+        },
+      );
+      ref.invalidate(routeListProvider);
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<void> removeSalesman(int routeId, int salesmanId, {String? dayOfWeek}) async {
+    try {
+      await api.client.delete(
+        '/routes/$routeId/remove-salesman/$salesmanId',
+        queryParameters: {
+          if (dayOfWeek != null) 'day_of_week': dayOfWeek,
+        },
+      );
+      ref.invalidate(routeListProvider);
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> fetchSalesmenList() async {
+    try {
+      final response = await api.client.get('/salesmen');
+      if (response.statusCode == 200) {
+        return _parseListResponse(response.data);
+      }
+      throw Exception(
+        'سێرڤەر کۆدی نادروستی گەڕاندەوە (Server returned invalid code): ${response.statusCode}',
+      );
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> fetchRouteCustomers(int routeId) async {
+    try {
+      final response = await api.client.get('/routes/$routeId/customers');
+      if (response.statusCode == 200) {
+        return _parseListResponse(response.data);
+      }
+      throw Exception(
+        'سێرڤەر کۆدی نادروستی گەڕاندەوە (Server returned invalid code): ${response.statusCode}',
+      );
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<void> reorderCustomers(int routeId, List<int> customerIds) async {
+    try {
+      await api.client.post(
+        '/routes/$routeId/reorder-customers',
+        data: {'customer_ids': customerIds},
+      );
+      ref.invalidate(routeListProvider);
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<void> assignCustomers(int routeId, List<int> customerIds) async {
+    try {
+      await api.client.post(
+        '/routes/$routeId/assign-customers',
+        data: {'customer_ids': customerIds},
+      );
+      ref.invalidate(routeListProvider);
+      ref.invalidate(customerListProvider);
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+}

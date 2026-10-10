@@ -1,0 +1,638 @@
+import 'package:pos_app/core/utils/formatters.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../core/components/app_card.dart';
+import '../../../core/components/app_button.dart';
+import '../../../core/components/customer_avatar.dart';
+import '../../../core/components/app_text_field.dart';
+import '../../../core/components/app_pagination.dart';
+import '../../../core/components/app_snackbar.dart';
+import '../../../core/theme/app_colors.dart';
+import '../../../core/theme/app_icons.dart';
+import '../../../core/theme/app_spacing.dart';
+import '../../../core/theme/app_text_styles.dart';
+import '../../shared/models/customer.dart';
+import '../../shared/models/route_model.dart';
+import '../../shared/providers/customer_provider.dart';
+import '../../shared/providers/route_provider.dart';
+import '../../shared/views/customer_form_dialog.dart';
+
+class AdminCustomersScreen extends ConsumerStatefulWidget {
+  const AdminCustomersScreen({super.key});
+
+  @override
+  ConsumerState<AdminCustomersScreen> createState() =>
+      _AdminCustomersScreenState();
+}
+
+class _AdminCustomersScreenState extends ConsumerState<AdminCustomersScreen> {
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
+  int? _selectedRouteId;
+  bool _onlyDebtors = false;
+  int _currentPage = 1;
+
+  @override
+  void initState() {
+    super.initState();
+    _searchController.addListener(() {
+      final query = _searchController.text.trim().toLowerCase();
+      if (_searchQuery != query) {
+        setState(() {
+          _searchQuery = query;
+          _currentPage = 1; // Reset to page 1 on search
+        });
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _showAddCustomerDialog(BuildContext context, [Customer? customer]) {
+    showDialog<bool>(
+      context: context,
+      builder: (context) => CustomerFormDialog(customer: customer),
+    ).then((success) {
+      if (success == true) {
+        ref.invalidate(filteredCustomerListProvider);
+        ref.invalidate(customerListProvider);
+        if (customer != null) {
+          ref.invalidate(singleCustomerProvider(customer.id));
+        }
+      }
+    });
+  }
+
+  void _showDeleteCustomerDialog(BuildContext context, Customer customer) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Expanded(
+              child: Text('سڕینەوەی کڕیار', style: AppTextStyles.h3),
+            ),
+            IconButton(
+              icon: const Icon(Icons.close),
+              onPressed: () => Navigator.pop(context),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('دڵنیایت لە سڕینەوەی کڕیاری "${customer.name}"؟'),
+            if (customer.balance > 0) ...[
+              const SizedBox(height: AppSpacing.sm),
+              Container(
+                padding: const EdgeInsets.all(AppSpacing.sm),
+                decoration: BoxDecoration(
+                  color: AppColors.danger.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: AppColors.danger.withValues(alpha: 0.3),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.warning_amber_rounded,
+                      color: AppColors.danger,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'ئاگاداربە: ئەم کڕیارە بڕی ${Formatters.currency(customer.balance)} قەرزی لەسەرە!',
+                        style: AppTextStyles.caption.copyWith(
+                          color: AppColors.danger,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: AppColors.danger,
+            ),
+            onPressed: () async {
+              Navigator.pop(context);
+              try {
+                await ref
+                    .read(customerActionsProvider)
+                    .deleteCustomer(customer.id);
+                ref.invalidate(filteredCustomerListProvider);
+                ref.invalidate(customerListProvider);
+                if (context.mounted) {
+                  AppSnackbar.show(
+                    context,
+                    message: 'کڕیار بە سەرکەوتوویی سڕایەوە',
+                    type: SnackbarType.success,
+                  );
+                }
+              } catch (e) {
+                if (context.mounted) {
+                  AppSnackbar.show(
+                    context,
+                    message: 'هەڵە لە سڕینەوە: $e',
+                    type: SnackbarType.error,
+                  );
+                }
+              }
+            },
+            child: const Text('سڕینەوە'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final routesAsync = ref.watch(routeListProvider);
+
+    final filters = CustomerFilters(
+      page: _currentPage,
+      routeId: _selectedRouteId,
+      onlyDebtors: _onlyDebtors,
+      searchQuery: _searchQuery,
+    );
+
+    final customersAsync = ref.watch(filteredCustomerListProvider(filters));
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('لیستی کڕیارەکان', style: AppTextStyles.h2),
+        actions: [
+          IconButton(
+            icon: const Icon(AppIcons.add),
+            tooltip: 'زیادکردنی کڕیار',
+            onPressed: () => _showAddCustomerDialog(context),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // Search Field
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.screenHorizontal,
+              AppSpacing.sm,
+              AppSpacing.screenHorizontal,
+              AppSpacing.xs,
+            ),
+            child: AppTextField(
+              controller: _searchController,
+              hintText: 'گەڕان بۆ کڕیار، تەلەفۆن...',
+              prefixIcon: AppIcons.search,
+            ),
+          ),
+
+          // Filters Row (Routes & Debt Filter)
+          Padding(
+            padding: const EdgeInsets.symmetric(
+              horizontal: AppSpacing.screenHorizontal,
+            ),
+            child: routesAsync.when(
+              data: (routes) => _buildFiltersBar(context, routes),
+              loading: () => const SizedBox(
+                height: 48,
+                child: Center(child: LinearProgressIndicator()),
+              ),
+              error: (err, _) => Padding(
+                padding: const EdgeInsets.all(8.0),
+                child: Text(
+                  'هەڵە لە بارکردنی ڕاوتەکان: $err',
+                  style: const TextStyle(color: AppColors.danger),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: AppSpacing.xs),
+
+          // Customer Grid List
+          Expanded(
+            child: RefreshIndicator(
+              onRefresh: () async {
+                ref.invalidate(filteredCustomerListProvider);
+                ref.invalidate(customerListProvider);
+              },
+              child: customersAsync.when(
+                loading: () => const Center(child: CircularProgressIndicator()),
+                error: (error, stack) => Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(AppSpacing.lg),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(
+                          Icons.error_outline,
+                          size: 48,
+                          color: AppColors.danger,
+                        ),
+                        const SizedBox(height: AppSpacing.md),
+                        Text(
+                          'کێشەیەک ڕوویدا لە بارکردنی داتاکان:',
+                          style: AppTextStyles.bodyMedium,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '$error',
+                          style: AppTextStyles.caption.copyWith(
+                            color: theme.colorScheme.error,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: AppSpacing.md),
+                        AppButton(
+                          text: 'دووبارە هەوڵبدەرەوە',
+                          onPressed: () {
+                            ref.invalidate(filteredCustomerListProvider);
+                            ref.invalidate(customerListProvider);
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                data: (paginated) {
+                  final customers = paginated.data;
+                  if (customers.isEmpty) {
+                    return _buildEmptyState(theme);
+                  }
+
+                  final screenWidth = MediaQuery.of(context).size.width;
+                  int crossAxisCount = 1;
+                  if (screenWidth >= 1024) {
+                    crossAxisCount = 3;
+                  } else if (screenWidth >= 600) {
+                    crossAxisCount = 2;
+                  }
+
+                  return Column(
+                    children: [
+                      Expanded(
+                        child: GridView.builder(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: AppSpacing.screenHorizontal,
+                            vertical: AppSpacing.xs,
+                          ),
+                          itemCount: customers.length,
+                          gridDelegate:
+                              SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: crossAxisCount,
+                                crossAxisSpacing: AppSpacing.md,
+                                mainAxisSpacing: AppSpacing.sm,
+                                mainAxisExtent: 82,
+                              ),
+                          itemBuilder: (context, index) {
+                            final customer = customers[index];
+                            return _buildCustomerCard(context, customer);
+                          },
+                        ),
+                      ),
+                      // Pagination Controls
+                      AppPagination(
+                        currentPage: paginated.currentPage,
+                        totalPages: paginated.lastPage,
+                        onPageChanged: (page) {
+                          setState(() {
+                            _currentPage = page;
+                          });
+                        },
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFiltersBar(BuildContext context, List<RouteModel> routes) {
+    final theme = Theme.of(context);
+    return SizedBox(
+      height: 44,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        physics: const BouncingScrollPhysics(),
+        children: [
+          // Debt filter toggle
+          Padding(
+            padding: const EdgeInsets.only(left: 8.0),
+            child: FilterChip(
+              selected: _onlyDebtors,
+              label: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('قەرزارەکان '),
+                  Icon(
+                    Icons.warning_amber_rounded,
+                    size: 14,
+                    color: AppColors.danger,
+                  ),
+                ],
+              ),
+              onSelected: (selected) {
+                setState(() {
+                  _onlyDebtors = selected;
+                  _currentPage = 1;
+                });
+              },
+              selectedColor: AppColors.danger.withValues(alpha: 0.15),
+              checkmarkColor: AppColors.danger,
+              labelStyle: AppTextStyles.caption.copyWith(
+                color: _onlyDebtors
+                    ? AppColors.danger
+                    : theme.colorScheme.onSurface,
+                fontWeight: _onlyDebtors ? FontWeight.bold : FontWeight.normal,
+              ),
+            ),
+          ),
+
+          // Divider
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 4.0),
+            child: VerticalDivider(width: 1, indent: 8, endIndent: 8),
+          ),
+
+          // All routes
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6.0),
+            child: FilterChip(
+              selected: _selectedRouteId == null,
+              label: const Text('هەموو گەڕەکەکان'),
+              onSelected: (selected) {
+                if (selected) {
+                  setState(() {
+                    _selectedRouteId = null;
+                    _currentPage = 1;
+                  });
+                }
+              },
+              selectedColor: theme.colorScheme.primaryContainer,
+              checkmarkColor: theme.colorScheme.primary,
+              labelStyle: AppTextStyles.caption.copyWith(
+                color: _selectedRouteId == null
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurface,
+                fontWeight: _selectedRouteId == null
+                    ? FontWeight.bold
+                    : FontWeight.normal,
+              ),
+            ),
+          ),
+
+          // Other routes
+          ...routes.map((route) {
+            final isSelected = _selectedRouteId == route.id;
+            return Padding(
+              padding: const EdgeInsets.only(left: 6.0),
+              child: FilterChip(
+                selected: isSelected,
+                label: Text(route.name),
+                onSelected: (selected) {
+                  setState(() {
+                    _selectedRouteId = selected ? route.id : null;
+                    _currentPage = 1;
+                  });
+                },
+                selectedColor: theme.colorScheme.primaryContainer,
+                checkmarkColor: theme.colorScheme.primary,
+                labelStyle: AppTextStyles.caption.copyWith(
+                  color: isSelected
+                      ? theme.colorScheme.primary
+                      : theme.colorScheme.onSurface,
+                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                ),
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCustomerCard(BuildContext context, Customer customer) {
+    final theme = Theme.of(context);
+    final bool hasDebt = customer.balance > 0;
+
+    String priceTierLabel = 'تاک (N1)';
+    Color tierColor = Colors.teal;
+    if (customer.priceType == 'N2') {
+      priceTierLabel = 'کۆ (N2)';
+      tierColor = Colors.blue;
+    } else if (customer.priceType == 'N3') {
+      priceTierLabel = 'تایبەت (N3)';
+      tierColor = Colors.purple;
+    }
+
+    String formatCurrency(num amount) {
+      return '${Formatters.currency(amount)}';
+    }
+
+    return AppCard(
+      onTap: () => _showAddCustomerDialog(context, customer),
+      onLongPress: () => _showDeleteCustomerDialog(context, customer),
+      padding: const EdgeInsets.symmetric(
+        horizontal: 12,
+        vertical: 8,
+      ),
+      child: Row(
+        children: [
+          // Profile image or initials
+          CustomerAvatar(
+            imageUrl: customer.imageUrl,
+            size: 48,
+            borderRadius: 14,
+          ),
+          const SizedBox(width: AppSpacing.sm),
+
+          // Middle section: details
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        customer.name,
+                        style: AppTextStyles.bodyBold.copyWith(fontSize: 14),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (!customer.isActive) ...[
+                      const SizedBox(width: 4),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 1,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade200,
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          'ناچالاک',
+                          style: TextStyle(
+                            fontSize: 9,
+                            color: Colors.grey.shade700,
+                            fontFamily: 'Rudaw',
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  customer.phone ?? 'مۆبایل نییە',
+                  style: AppTextStyles.caption.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontSize: 11,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Row(
+                  children: [
+                    // Route badge
+                    Icon(
+                      Icons.alt_route,
+                      size: 11,
+                      color: theme.colorScheme.onSurfaceVariant.withValues(
+                        alpha: 0.6,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: Text(
+                        customer.route?.name ?? 'گەڕەک دیارینەکراوە',
+                        style: AppTextStyles.caption.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant
+                              .withValues(alpha: 0.8),
+                          fontSize: 11,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+
+          // Left section: Price type & balance
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              // Price tier badge
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 7,
+                  vertical: 2,
+                ),
+                decoration: BoxDecoration(
+                  color: tierColor.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  priceTierLabel,
+                  style: AppTextStyles.caption.copyWith(
+                    color: tierColor,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 10,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 4),
+
+              // Balance badge
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 7,
+                  vertical: 2,
+                ),
+                decoration: BoxDecoration(
+                  color: hasDebt
+                      ? AppColors.danger.withValues(alpha: 0.1)
+                      : AppColors.success.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  hasDebt ? formatCurrency(customer.balance) : 'بێ قەرز',
+                  style: AppTextStyles.bodyBold.copyWith(
+                    color: hasDebt ? AppColors.danger : AppColors.success,
+                    fontSize: 10,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptyState(ThemeData theme) {
+    return Center(
+      child: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.all(AppSpacing.lg),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.people_outline,
+                size: 64,
+                color: theme.colorScheme.onSurfaceVariant.withValues(
+                  alpha: 0.4,
+                ),
+              ),
+              const SizedBox(height: AppSpacing.md),
+              Text('هیچ کڕیارێک نییە', style: AppTextStyles.h3),
+              const SizedBox(height: AppSpacing.sm),
+              Text(
+                'هیچ کڕیارێک بەو مەرجانە نەدۆزرایەوە کە دیاریت کردوون.',
+                style: AppTextStyles.caption.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: AppSpacing.lg),
+              SizedBox(
+                width: 180,
+                child: AppButton(
+                  text: 'کڕیاری نوێ زیادبکە',
+                  onPressed: () => _showAddCustomerDialog(context),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

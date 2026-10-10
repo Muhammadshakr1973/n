@@ -1,0 +1,155 @@
+// ignore_for_file: avoid_web_libraries_in_flutter, deprecated_member_use
+// web implementation of barcode helper using dart:html
+import 'dart:async';
+import 'dart:html' as html;
+import 'dart:typed_data';
+import 'dart:js' as js;
+import 'package:flutter/foundation.dart';
+import 'package:share_plus/share_plus.dart';
+
+void saveAndDownloadImage(Uint8List bytes, String fileName) {
+  try {
+    final blob = html.Blob([bytes], 'image/png');
+    final url = html.Url.createObjectUrlFromBlob(blob);
+    final anchor = html.AnchorElement(href: url)
+      ..setAttribute("download", fileName)
+      ..style.display = 'none';
+    html.document.body?.children.add(anchor);
+    anchor.click();
+    anchor.remove();
+    html.Url.revokeObjectUrl(url);
+  } catch (e) {
+    debugPrint('Error downloading barcode image: $e');
+  }
+}
+
+void printImage(Uint8List bytes) {
+  try {
+    final imageBlob = html.Blob([bytes], 'image/png');
+    final imageUrl = html.Url.createObjectUrlFromBlob(imageBlob);
+
+    final htmlContent = '''
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>چاپکردنی بارکۆد</title>
+        <style>
+          body {
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: 'Rudaw', sans-serif;
+            background-color: white;
+          }
+          .container {
+            text-align: center;
+            border: 1px dashed #ccc;
+            padding: 20px;
+            border-radius: 8px;
+          }
+          img {
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 0 auto 10px auto;
+          }
+          p {
+            margin: 0;
+            font-size: 16px;
+            font-weight: bold;
+            color: #333;
+          }
+          @page {
+            size: 50mm 30mm;
+            margin: 0;
+          }
+          @media print {
+            html, body {
+              width: 50mm;
+              height: 30mm;
+              margin: 0;
+              padding: 0;
+            }
+            .container {
+              border: none;
+              padding: 0;
+              margin: 0;
+              width: 50mm;
+              height: 30mm;
+            }
+            img {
+              width: 50mm;
+              height: auto;
+              max-height: 30mm;
+              margin: 0;
+              display: block;
+            }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <img src="$imageUrl" onload="window.print();" />
+        </div>
+      </body>
+      </html>
+    ''';
+
+    final htmlBlob = html.Blob([htmlContent], 'text/html');
+    final htmlUrl = html.Url.createObjectUrlFromBlob(htmlBlob);
+    html.window.open(htmlUrl, '_blank');
+
+    // Revoke object URLs after delay to allow rendering and printing
+    Timer(const Duration(minutes: 2), () {
+      html.Url.revokeObjectUrl(htmlUrl);
+      html.Url.revokeObjectUrl(imageUrl);
+    });
+  } catch (e) {
+    debugPrint('Error printing barcode image: $e');
+  }
+}
+
+Future<void> shareImage(Uint8List bytes, String fileName, {String? text}) async {
+  try {
+    final xFile = XFile.fromData(
+      bytes,
+      name: fileName,
+      mimeType: 'image/png',
+    );
+    final result = await Share.shareXFiles(
+      [xFile],
+      text: text ?? 'کۆدی چوونەژوورەوەی GARDI ERP',
+    );
+    if (result.status == ShareResultStatus.success) {
+      return;
+    }
+  } catch (e) {
+    debugPrint('share_plus error on web: $e');
+  }
+
+  try {
+    final blob = html.Blob([bytes], 'image/png');
+    final file = html.File([blob], fileName, {'type': 'image/png'});
+    final navigator = js.context['navigator'];
+    if (navigator != null) {
+      final jsNavigator = js.JsObject.fromBrowserObject(navigator);
+      if (jsNavigator.hasProperty('share')) {
+        final shareData = js.JsObject.jsify({
+          'files': [file],
+          'title': 'Gardi QR Code',
+          'text': text ?? 'کۆدی چوونەژوورەوەی GARDI ERP',
+        });
+        jsNavigator.callMethod('share', [shareData]);
+        return;
+      }
+    }
+  } catch (e) {
+    debugPrint('Share not supported: $e');
+  }
+
+  saveAndDownloadImage(bytes, fileName);
+}
+

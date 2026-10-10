@@ -1,0 +1,217 @@
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../core/api_client.dart';
+import '../../../core/sync/pusher_service.dart';
+import '../../admin/views/providers/driver_collection_provider.dart';
+import '../../orders/providers/orders_provider.dart';
+import '../models/delivery_trip_model.dart';
+
+class DriverUserSummary {
+  final int id;
+  final String name;
+  final String? phone;
+
+  DriverUserSummary({
+    required this.id,
+    required this.name,
+    this.phone,
+  });
+
+  factory DriverUserSummary.fromJson(Map<String, dynamic> json) {
+    return DriverUserSummary(
+      id: json['id'] is int ? json['id'] : int.tryParse(json['id'].toString()) ?? 0,
+      name: json['name']?.toString() ?? '',
+      phone: json['phone']?.toString(),
+    );
+  }
+}
+
+final activeDriversProvider = FutureProvider<List<DriverUserSummary>>((ref) async {
+  final api = ref.watch(apiClientProvider);
+  try {
+    final response = await api.client.get('/delivery-trips/drivers');
+    if (response.statusCode == 200) {
+      final resData = response.data;
+      if (resData is! Map || resData['data'] is! List) {
+        throw FormatException(
+          'داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed drivers response payload)',
+        );
+      }
+      final List data = resData['data'] as List;
+      return data
+          .whereType<Map>()
+          .map((json) => DriverUserSummary.fromJson(Map<String, dynamic>.from(json)))
+          .toList();
+    }
+    throw Exception('سێرڤەر کۆدی نادروستی گەڕاندەوە: ${response.statusCode}');
+  } catch (e) {
+    throw Exception(api.parseError(e));
+  }
+});
+
+final driverTripsProvider = FutureProvider<List<DeliveryTripModel>>((ref) async {
+  final api = ref.watch(apiClientProvider);
+  final pusher = ref.watch(pusherServiceProvider);
+
+  void onDriverTripsEvent(Map<String, dynamic> eventData) {
+    debugPrint("Realtime update received on private-delivery-trips: $eventData");
+    ref.invalidateSelf();
+  }
+
+  pusher.subscribeToChannel('private-delivery-trips', onDriverTripsEvent);
+
+  ref.onDispose(() {
+    pusher.unsubscribeFromChannel('private-delivery-trips', onDriverTripsEvent);
+  });
+
+  try {
+    final response = await api.client.get('/delivery-trips');
+    if (response.statusCode == 200) {
+      final resData = response.data;
+      if (resData is! Map || resData['data'] is! List) {
+        throw FormatException(
+          'داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed driver trips response payload)',
+        );
+      }
+      final List data = resData['data'] as List;
+      return data.map((json) => DeliveryTripModel.fromJson(json)).toList();
+    }
+    throw Exception('سێرڤەر کۆدی نادروستی گەڕاندەوە (Server returned invalid code): ${response.statusCode}');
+  } catch (e) {
+    throw Exception(api.parseError(e));
+  }
+});
+
+final tripDetailProvider =
+    FutureProvider.family<DeliveryTripModel, int>((ref, tripId) async {
+  final api = ref.watch(apiClientProvider);
+  final pusher = ref.watch(pusherServiceProvider);
+
+  void onTripDetailEvent(Map<String, dynamic> eventData) {
+    debugPrint("Realtime update received on private-delivery-trips for single trip: $eventData");
+    ref.invalidateSelf();
+  }
+
+  pusher.subscribeToChannel('private-delivery-trips', onTripDetailEvent);
+
+  ref.onDispose(() {
+    pusher.unsubscribeFromChannel('private-delivery-trips', onTripDetailEvent);
+  });
+
+  try {
+    final response = await api.client.get('/delivery-trips/$tripId');
+    if (response.statusCode == 200) {
+      final resData = response.data;
+      if (resData is! Map || resData['data'] is! Map) {
+        throw FormatException(
+          'داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed trip detail response payload)',
+        );
+      }
+      return DeliveryTripModel.fromJson(Map<String, dynamic>.from(resData['data']));
+    }
+    throw Exception('گەشتەکە نەدۆزرایەوە');
+  } catch (e) {
+    throw Exception(api.parseError(e));
+  }
+});
+
+final driverActionsProvider = Provider<DriverActions>((ref) {
+  final api = ref.watch(apiClientProvider);
+  return DriverActions(api, ref);
+});
+
+class DriverActions {
+  final ApiClient api;
+  final Ref ref;
+
+  DriverActions(this.api, this.ref);
+
+  Future<void> createDeliveryTrip({
+    required int driverId,
+    required String tripDate,
+    required List<int> orderIds,
+    String? notes,
+    String? customEntityId,
+  }) async {
+    try {
+      final entityId = customEntityId ?? 'trip_${DateTime.now().microsecondsSinceEpoch}';
+      final payload = <String, dynamic>{
+        'driver_id': driverId,
+        'trip_date': tripDate,
+        'order_ids': orderIds,
+        'idempotency_key': entityId,
+      };
+      if (notes != null && notes.trim().isNotEmpty) {
+        payload['notes'] = notes.trim();
+      }
+
+      await api.client.post(
+        '/delivery-trips',
+        data: payload,
+        options: Options(
+          headers: {
+            'X-Idempotency-Key': entityId,
+          },
+        ),
+      );
+
+      ref.invalidate(driverTripsProvider);
+      ref.invalidate(ordersListProvider);
+      ref.invalidate(readyOrdersForDeliveryProvider);
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<void> deliverOrder({
+    required int tripOrderId,
+    required int receivedAmount,
+    String? notes,
+  }) async {
+    try {
+      final idempotencyKey = 'deliver_${tripOrderId}_${DateTime.now().microsecondsSinceEpoch}';
+      await api.client.post(
+        '/delivery-trips/orders/$tripOrderId/deliver',
+        data: {
+          'received_amount': receivedAmount,
+          'notes': notes,
+        },
+        options: Options(
+          headers: {
+            'X-Idempotency-Key': idempotencyKey,
+          },
+        ),
+      );
+      ref.invalidate(driverTripsProvider);
+      ref.invalidate(driverCashSummaryProvider);
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<void> failOrder({
+    required int tripOrderId,
+    required String failedReason,
+    String? notes,
+  }) async {
+    try {
+      final idempotencyKey = 'fail_${tripOrderId}_${DateTime.now().microsecondsSinceEpoch}';
+      await api.client.post(
+        '/delivery-trips/orders/$tripOrderId/fail',
+        data: {
+          'failed_reason': failedReason,
+          'notes': notes,
+        },
+        options: Options(
+          headers: {
+            'X-Idempotency-Key': idempotencyKey,
+          },
+        ),
+      );
+      ref.invalidate(driverTripsProvider);
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+}

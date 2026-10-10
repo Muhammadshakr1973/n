@@ -1,0 +1,178 @@
+import 'package:flutter/material.dart';
+
+import '../theme/app_colors.dart';
+import '../theme/app_radius.dart';
+import '../theme/app_sizes.dart';
+import '../theme/app_text_styles.dart';
+
+enum AppButtonType { primary, secondary, outline, text, danger, textDanger, success }
+
+enum AppButtonSize { sm, md, lg }
+
+class AppButton extends StatelessWidget {
+  final String text;
+  final VoidCallback? onPressed;
+  final AppButtonType type;
+  final AppButtonSize size;
+  final bool isLoading;
+  final IconData? icon;
+  final double? width;
+
+  const AppButton({
+    Key? key,
+    required this.text,
+    this.onPressed,
+    this.type = AppButtonType.primary,
+    this.size = AppButtonSize.md,
+    this.isLoading = false,
+    this.icon,
+    this.width,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isDisabled = onPressed == null || isLoading;
+
+    // Determine height
+    double height;
+    switch (size) {
+      case AppButtonSize.lg:
+        height = AppSizes.buttonHeightLg;
+        break;
+      case AppButtonSize.sm:
+        height = AppSizes.buttonHeightSm;
+        break;
+      case AppButtonSize.md:
+      // ignore: unreachable_switch_default
+      default:
+        height = AppSizes.buttonHeightMd;
+        break;
+    }
+
+    // Colors
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
+    Color backgroundColor;
+    Color textColor;
+    Color borderColor = Colors.transparent;
+
+    switch (type) {
+      case AppButtonType.primary:
+        backgroundColor = theme.colorScheme.primary;
+        textColor = isDark ? const Color(0xFF0F172A) : Colors.white;
+        break;
+      case AppButtonType.secondary:
+        backgroundColor = isDark ? AppColors.surfaceContainerDark : AppColors.primaryLight;
+        textColor = theme.colorScheme.primary;
+        break;
+      case AppButtonType.outline:
+        backgroundColor = Colors.transparent;
+        textColor = theme.colorScheme.primary;
+        borderColor = theme.colorScheme.primary;
+        break;
+      case AppButtonType.text:
+        backgroundColor = Colors.transparent;
+        textColor = theme.colorScheme.primary;
+        break;
+      case AppButtonType.danger:
+        backgroundColor = isDark ? const Color(0xFFDC2626) : theme.colorScheme.error;
+        textColor = Colors.white;
+        break;
+      case AppButtonType.textDanger:
+        backgroundColor = Colors.transparent;
+        textColor = isDark ? AppColors.dangerDark : theme.colorScheme.error;
+        break;
+      case AppButtonType.success:
+        backgroundColor = isDark ? AppColors.successDark : AppColors.success;
+        textColor = isDark ? const Color(0xFF0F172A) : Colors.white;
+        break;
+    }
+
+    if (isDisabled && type != AppButtonType.text && type != AppButtonType.textDanger) {
+      backgroundColor = isDark ? AppColors.borderDark : AppColors.borderLight;
+      textColor = isDark
+          ? AppColors.textDisabledDark
+          : AppColors.textDisabledLight;
+      borderColor = Colors.transparent;
+    }
+
+    Widget content = Text(
+      text,
+      style: AppTextStyles.button.copyWith(
+        color: textColor,
+        fontSize: size == AppButtonSize.sm ? 13 : 15,
+        fontWeight: FontWeight.bold,
+      ),
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+    );
+
+    if (isLoading) {
+      content = SizedBox(
+        height: 20,
+        width: 20,
+        child: CircularProgressIndicator(
+          strokeWidth: 2.5,
+          valueColor: AlwaysStoppedAnimation<Color>(textColor),
+        ),
+      );
+    } else if (icon != null) {
+      content = Row(
+        mainAxisSize: MainAxisSize.min,
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            icon,
+            color: textColor,
+            size: size == AppButtonSize.sm ? 18 : 22,
+          ),
+          const SizedBox(width: 8),
+          content,
+        ],
+      );
+    }
+
+    final buttonContent = FittedBox(
+      fit: BoxFit.scaleDown,
+      child: content,
+    );
+
+    return SizedBox(
+      height: height,
+      width: width,
+      child: type == AppButtonType.outline
+          ? OutlinedButton(
+              onPressed: isDisabled ? null : onPressed,
+              style: OutlinedButton.styleFrom(
+                foregroundColor: textColor,
+                side: BorderSide(color: borderColor, width: 1.5),
+                shape: RoundedRectangleBorder(borderRadius: AppRadius.radiusMd),
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+              ),
+              child: buttonContent,
+            )
+          : (type == AppButtonType.text || type == AppButtonType.textDanger)
+          ? TextButton(
+              onPressed: isDisabled ? null : onPressed,
+              style: TextButton.styleFrom(
+                foregroundColor: textColor,
+                shape: RoundedRectangleBorder(borderRadius: AppRadius.radiusMd),
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+              ),
+              child: buttonContent,
+            )
+          : ElevatedButton(
+              onPressed: isDisabled ? null : onPressed,
+              style: ElevatedButton.styleFrom(
+                foregroundColor: textColor,
+                backgroundColor: backgroundColor,
+                elevation: 0,
+                shape: RoundedRectangleBorder(borderRadius: AppRadius.radiusMd),
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+              ),
+              child: buttonContent,
+            ),
+    );
+  }
+}

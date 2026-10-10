@@ -1,0 +1,89 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../core/theme/app_icons.dart';
+import '../../../core/components/responsive_shell.dart';
+import '../../../core/router/navigation_tabs_provider.dart';
+import 'admin_dashboard_screen.dart';
+import 'admin_orders_screen.dart';
+import 'admin_customers_screen.dart';
+import 'admin_routes_screen.dart';
+import 'admin_purchases_screen.dart';
+import 'admin_products_screen.dart';
+import 'admin_reports_screen.dart';
+import 'admin_users_screen.dart';
+
+export '../../../core/router/navigation_tabs_provider.dart';
+
+class AdminMainScreen extends ConsumerStatefulWidget {
+  const AdminMainScreen({super.key});
+
+  @override
+  ConsumerState<AdminMainScreen> createState() => _AdminMainScreenState();
+}
+
+class _AdminMainScreenState extends ConsumerState<AdminMainScreen> {
+  final List<Widget> _screens = [
+    const AdminDashboardScreen(),
+    const AdminUsersScreen(),
+    const AdminRoutesScreen(),
+    const AdminReportsScreen(),
+    const AdminOrdersScreen(),
+    const AdminCustomersScreen(),
+    const AdminPurchasesScreen(),
+    const AdminProductsScreen(),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        ref.read(adminTabIndexProvider.notifier).state = 0;
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final currentIndex = ref.watch(adminTabIndexProvider);
+
+    return ResponsiveShell(
+      currentIndex: currentIndex,
+      onDestinationSelected: (index) {
+        ref.read(adminTabIndexProvider.notifier).state = index;
+      },
+      mobilePrimaryIndices: const [0, 1, 2, 3],
+      body: IndexedStack(
+        index: currentIndex,
+        children: List.generate(_screens.length, (index) {
+          final isSelected = index == currentIndex;
+          return Visibility(
+            visible: isSelected,
+            maintainState: true,
+            child: FocusScope(
+              canRequestFocus: isSelected,
+              child: TickerMode(enabled: isSelected, child: _screens[index]),
+            ),
+          );
+        }),
+      ),
+      destinations: const [
+        NavigationDestination(icon: Icon(AppIcons.home), label: 'سەرەکی'),
+        NavigationDestination(icon: Icon(Icons.people), label: 'بەکارهێنەران'),
+        NavigationDestination(icon: Icon(Icons.alt_route), label: 'ڕاوتەکان'),
+        NavigationDestination(icon: Icon(Icons.bar_chart), label: 'ڕاپۆرت'),
+        NavigationDestination(icon: Icon(AppIcons.order), label: 'پسوڵەکان'),
+        NavigationDestination(
+          icon: Icon(AppIcons.customers),
+          label: 'کڕیارەکان',
+        ),
+        NavigationDestination(icon: Icon(Icons.store), label: 'کۆمپانیا'),
+        NavigationDestination(
+          icon: Icon(Icons.inventory_2_outlined),
+          label: 'کاڵاکان',
+        ),
+      ],
+    );
+  }
+}

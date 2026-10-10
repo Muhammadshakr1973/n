@@ -1,0 +1,1071 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Customer;
+use App\Models\Product;
+use App\Models\SalesOrder;
+use App\Models\WarehouseStock;
+use App\Models\StockTransaction;
+use App\Models\PurchaseRequirement;
+use App\Models\CustomerLedger;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
+
+class SalesOrderService
+{
+    protected array $validTransitions = [
+        SalesOrder::STATUS_PACKING => [SalesOrder::STATUS_READY, SalesOrder::STATUS_CANCELLED],
+        SalesOrder::STATUS_READY => [SalesOrder::STATUS_IN_DELIVERY, SalesOrder::STATUS_CANCELLED],
+        SalesOrder::STATUS_IN_DELIVERY => [SalesOrder::STATUS_DELIVERED, SalesOrder::STATUS_READY, SalesOrder::STATUS_CANCELLED],
+        SalesOrder::STATUS_DELIVERED => [],
+        SalesOrder::STATUS_CANCELLED => [],
+        // Legacy fallbacks for historical database records
+        SalesOrder::STATUS_DRAFT => [SalesOrder::STATUS_PACKING, SalesOrder::STATUS_CANCELLED],
+        SalesOrder::STATUS_CONFIRMED => [SalesOrder::STATUS_PACKING, SalesOrder::STATUS_READY, SalesOrder::STATUS_CANCELLED],
+    ];
+    /**
+     * دروستکردنی پسوڵەی فرۆشتن بە شێوەی تۆکمە و سەلامەت
+     */
+    public function createOrder(array $data, $user): SalesOrder
+    {
+        // Check if there is a shared key indicating cooperative dual entry
+        $sharedKey = $data['shared_key'] ?? null;
+        if ($sharedKey) {
+            $existingSharedOrder = SalesOrder::where('shared_key', $sharedKey)->first();
+            if ($existingSharedOrder) {
+                return $this->updateSharedOrder($existingSharedOrder, $data, $user);
+            }
+        }
+
+        // ١. پاراستنی لایەنی یەکسانی (Idempotency) بۆ ڕێگری لە دروستکردنی پسوڵەی دووبارە بەهۆی دووجار کلیککردن
+        // Bypass time-based heuristic if request has a true Idempotency-Key, as the middleware guarantees uniqueness
+        $hasTrueIdempotency = request()->hasHeader('X-Idempotency-Key') || request()->hasHeader('Idempotency-Key');
+        if (!$hasTrueIdempotency) {
+            $existingOrder = $this->checkIdempotency($data['customer_id'], $data['warehouse_id'], $data['items']);
+            if ($existingOrder) {
+                return $existingOrder;
+            }
+        }
+
+        $order = DB::transaction(function () use ($data, $user) {
+            // ٢. قفڵکردنی ڕیزی کڕیار بۆ ڕێگری لە گۆڕانکاری هاوکات
+            $customer = $this->getCustomerForOrder($data['customer_id']);
+
+            // ٣. دڵنیابوونەوە لەوەی کە کڕیارەکە بۆ ئەم مەندوبە دەستنیشان کراوە (Authorization & Assignment)
+            $this->checkCustomerAssignment($customer, $user);
+
+            // دروستکردنی ژمارەی تایبەت بۆ پسوڵە (ORD-XXXXXXXX)
+            $orderNumber = 'ORD-' . strtoupper(Str::random(8));
+
+            // دروستکردنی پسوڵە ڕاستەوخۆ بە شێوەی PACKING بەپێی داواکاری سیستەم
+            $order = SalesOrder::create([
+                'order_number' => $orderNumber,
+                'shared_key' => $data['shared_key'] ?? null,
+                'version' => 1,
+                'customer_id' => $customer->id,
+                'salesman_id' => $user->id,
+                'warehouse_id' => $data['warehouse_id'],
+                'order_date' => now()->toDateString(),
+                'status' => SalesOrder::STATUS_PACKING,
+                'confirmed_at' => now(),
+                'notes' => $data['notes'] ?? null,
+                'created_by' => $user->id,
+                'subtotal' => 0,
+                'permanent_discount_percent' => 0,
+                'permanent_discount_amount' => 0,
+                'discount_percent' => 0,
+                'discount_amount' => 0,
+                'discount_type' => 'PERCENT',
+                'total_amount' => 0,
+                'total_profit' => 0,
+            ]);
+
+            $subtotal = 0;
+            $totalProfit = 0;
+
+            // پاشەکەوتکردنی کاڵاکان بە شێوەی سێریاڵ
+            foreach ($data['items'] ?? [] as $item) {
+                $quantity = (int) $item['quantity'];
+                if ($quantity <= 0) {
+                    throw ValidationException::withMessages([
+                        'items' => 'بڕی کاڵا دەبێت لە ١ کەمتر نەبێت.'
+                    ]);
+                }
+
+                $product = Product::findOrFail($item['product_id']);
+
+                // دیاریکردنی نرخ بەپێی تایپ و کڕیار (تۆمارکردنی مێژوویی - Snapshot)
+                if (isset($data['price_type'])) {
+                    $requestedType = strtoupper($data['price_type']);
+                    $priceType = in_array($requestedType, ['N1', 'N2', 'N3']) ? $requestedType : 'N3';
+                    $unitPrice = (int) $product->getPriceForType($priceType);
+                } else {
+                    $priceDetails = $customer->getPriceDetailsForProduct($product);
+                    $unitPrice = (int) $priceDetails['price'];
+                    $priceType = $priceDetails['price_type'];
+                }
+                $costPrice = (int) $product->cost_price; // Snapshot نرخی کڕین
+
+                $lineTotal = $unitPrice * $quantity;
+                $profit = ($unitPrice - $costPrice) * $quantity;
+
+                $order->items()->create([
+                    'product_id' => $product->id,
+                    'quantity' => $quantity,
+                    'unit_price' => $unitPrice,
+                    'cost_price' => $costPrice, // Snapshot
+                    'price_type' => $priceType,
+                    'discount_percent' => 0,
+                    'discount_amount' => 0,
+                    'line_total' => $lineTotal,
+                    'total_price' => $lineTotal,
+                    'profit' => $profit,
+                    'is_packed' => false,
+                    'notes' => $item['notes'] ?? null,
+                ]);
+
+                $subtotal += $lineTotal;
+                $totalProfit += $profit;
+            }
+
+            // ١. داشکاندنی بەردەوامی کڕیار (Permanent Customer Discount)
+            $permDiscountPercent = max(0, min(100, (float) ($customer->permanent_discount ?? 0)));
+            $permDiscountAmount = 0;
+            if ($permDiscountPercent > 0) {
+                $permDiscountAmount = (int) round(($subtotal * $permDiscountPercent) / 100);
+            }
+            $amountAfterPermDiscount = max(0, $subtotal - $permDiscountAmount);
+
+            // ٢. داشکاندنی تایبەت بەم پسوڵەیە (Invoice / Order Discount)
+            $discountType = strtoupper($data['discount_type'] ?? 'PERCENT');
+            $invoiceDiscountPercent = isset($data['discount_percent']) ? max(0, min(100, (float) $data['discount_percent'])) : 0.0;
+            $invoiceDiscountAmount = 0;
+
+            if ($discountType === 'FIXED' || (isset($data['discount_amount']) && (int)$data['discount_amount'] > 0 && $invoiceDiscountPercent == 0)) {
+                $discountType = 'FIXED';
+                $fixedAmount = (int) ($data['discount_amount'] ?? 0);
+                $invoiceDiscountAmount = min($amountAfterPermDiscount, max(0, $fixedAmount));
+            } elseif ($invoiceDiscountPercent > 0) {
+                $discountType = 'PERCENT';
+                $invoiceDiscountAmount = (int) round(($amountAfterPermDiscount * $invoiceDiscountPercent) / 100);
+            }
+
+            $totalAmount = max(0, $amountAfterPermDiscount - $invoiceDiscountAmount);
+            $netTotalProfit = $totalProfit - $permDiscountAmount - $invoiceDiscountAmount;
+
+            $order->update([
+                'subtotal' => $subtotal,
+                'permanent_discount_percent' => $permDiscountPercent,
+                'permanent_discount_amount' => $permDiscountAmount,
+                'discount_percent' => $invoiceDiscountPercent,
+                'discount_amount' => $invoiceDiscountAmount,
+                'discount_type' => $discountType,
+                'total_amount' => $totalAmount,
+                'total_profit' => $netTotalProfit,
+            ]);
+
+            // حجزکردنی ستۆک لە کۆگا ڕاستەوخۆ بەهۆی دۆخی PACKING
+            $this->reserveStock($order, $user);
+            $this->logActivity($order, null, SalesOrder::STATUS_PACKING, $user);
+
+            return $order;
+        });
+
+        // Notify new order created AFTER database commit if items present
+        $this->dispatchOrderNotification($order, $user);
+
+        try {
+            event(new \App\Events\SalesOrderUpdated($order, 'create'));
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning("Event broadcast failed for new order: " . $e->getMessage());
+        }
+
+        $order->wasRecentlyCreated = true;
+        return $order;
+    }
+
+    public function updateOrder(SalesOrder $order, array $data, $user): SalesOrder
+    {
+        if ($order->shared_key || isset($data['shared_key']) || isset($data['version'])) {
+            return $this->updateSharedOrder($order, $data, $user);
+        }
+
+        if (!in_array($order->status, [SalesOrder::STATUS_PACKING, SalesOrder::STATUS_DRAFT])) {
+            throw ValidationException::withMessages([
+                'status' => 'تەنها پسوڵەی PACKING دەتوانرێت دەستکاری بکرێت.'
+            ]);
+        }
+
+        $updatedOrder = DB::transaction(function () use ($order, $data, $user) {
+            $customerId = $data['customer_id'] ?? $order->customer_id;
+            $customer = $this->getCustomerForOrder($customerId);
+
+            $this->checkCustomerAssignment($customer, $user);
+
+            // ئەگەر پێشتر لە PACKING بوو، ستۆکی حجزکراو ئازاد دەکەین پێش نوێکردنەوەی ئایتمەکان
+            if ($order->status === SalesOrder::STATUS_PACKING) {
+                $this->releaseStock($order, $user);
+            }
+
+            // Update basic info
+            $order->update([
+                'customer_id' => $customer->id,
+                'notes' => $data['notes'] ?? $order->notes,
+                'warehouse_id' => $data['warehouse_id'] ?? $order->warehouse_id,
+            ]);
+
+            // Remove old items
+            $order->items()->forceDelete();
+
+            $subtotal = 0;
+            $totalProfit = 0;
+
+            foreach ($data['items'] ?? [] as $item) {
+                $quantity = (int) $item['quantity'];
+                if ($quantity <= 0) {
+                    throw ValidationException::withMessages([
+                        'items' => 'بڕی کاڵا دەبێت لە ١ کەمتر نەبێت.'
+                    ]);
+                }
+
+                $product = Product::findOrFail($item['product_id']);
+                if (isset($data['price_type'])) {
+                    $requestedType = strtoupper($data['price_type']);
+                    $priceType = in_array($requestedType, ['N1', 'N2', 'N3']) ? $requestedType : 'N3';
+                    $unitPrice = (int) $product->getPriceForType($priceType);
+                } else {
+                    $priceDetails = $customer->getPriceDetailsForProduct($product);
+                    $unitPrice = (int) $priceDetails['price'];
+                    $priceType = $priceDetails['price_type'];
+                }
+                $costPrice = (int) $product->cost_price;
+
+                $lineTotal = $unitPrice * $quantity;
+                $profit = ($unitPrice - $costPrice) * $quantity;
+
+                $order->items()->create([
+                    'product_id' => $product->id,
+                    'quantity' => $quantity,
+                    'unit_price' => $unitPrice,
+                    'cost_price' => $costPrice,
+                    'price_type' => $priceType,
+                    'discount_percent' => 0,
+                    'discount_amount' => 0,
+                    'line_total' => $lineTotal,
+                    'total_price' => $lineTotal,
+                    'profit' => $profit,
+                    'is_packed' => false,
+                    'notes' => $item['notes'] ?? null,
+                ]);
+
+                $subtotal += $lineTotal;
+                $totalProfit += $profit;
+            }
+
+            // ١. داشکاندنی بەردەوامی کڕیار (Permanent Customer Discount)
+            $permDiscountPercent = max(0, min(100, (float) ($customer->permanent_discount ?? 0)));
+            $permDiscountAmount = 0;
+            if ($permDiscountPercent > 0) {
+                $permDiscountAmount = (int) round(($subtotal * $permDiscountPercent) / 100);
+            }
+            $amountAfterPermDiscount = max(0, $subtotal - $permDiscountAmount);
+
+            // ٢. داشکاندنی تایبەت بەم پسوڵەیە (Invoice / Order Discount)
+            $discountType = strtoupper($data['discount_type'] ?? ($order->discount_type ?? 'PERCENT'));
+            $invoiceDiscountPercent = isset($data['discount_percent']) ? max(0, min(100, (float) $data['discount_percent'])) : max(0, min(100, (float) $order->discount_percent));
+            $invoiceDiscountAmount = 0;
+
+            if ($discountType === 'FIXED' || (isset($data['discount_amount']) && (int)$data['discount_amount'] > 0 && $invoiceDiscountPercent == 0)) {
+                $discountType = 'FIXED';
+                $fixedAmount = isset($data['discount_amount']) ? (int)$data['discount_amount'] : (int)$order->discount_amount;
+                $invoiceDiscountAmount = min($amountAfterPermDiscount, max(0, $fixedAmount));
+            } elseif ($invoiceDiscountPercent > 0) {
+                $discountType = 'PERCENT';
+                $invoiceDiscountAmount = (int) round(($amountAfterPermDiscount * $invoiceDiscountPercent) / 100);
+            }
+
+            $totalAmount = max(0, $amountAfterPermDiscount - $invoiceDiscountAmount);
+            $netTotalProfit = $totalProfit - $permDiscountAmount - $invoiceDiscountAmount;
+
+            $order->update([
+                'subtotal' => $subtotal,
+                'permanent_discount_percent' => $permDiscountPercent,
+                'permanent_discount_amount' => $permDiscountAmount,
+                'discount_percent' => $invoiceDiscountPercent,
+                'discount_amount' => $invoiceDiscountAmount,
+                'discount_type' => $discountType,
+                'total_amount' => $totalAmount,
+                'total_profit' => $netTotalProfit,
+            ]);
+
+            // ئەگەر لە دۆخی PACKING بوو، ستۆک بۆ ئایتمە نوێیەکان حجز دەکەینەوە
+            if ($order->status === SalesOrder::STATUS_PACKING) {
+                $this->reserveStock($order, $user);
+            }
+
+            $requestedStatus = $data['status'] ?? $order->status;
+            if ($requestedStatus !== $order->status && !in_array($requestedStatus, [SalesOrder::STATUS_DRAFT, SalesOrder::STATUS_PACKING])) {
+                $order = $this->transitionTo($order, $requestedStatus, $user);
+            }
+
+            return $order;
+        });
+
+        event(new \App\Events\SalesOrderUpdated($updatedOrder, 'update'));
+        $this->dispatchOrderNotification($updatedOrder, $user);
+
+        return $updatedOrder;
+    }
+
+    /**
+     * جێبەجێکردنی گواستنەوەی دۆخی پسوڵەکان بە شێوەی دەوڵەتی (State Machine)
+     */
+    public function transitionTo(SalesOrder $order, string $newStatus, $user): SalesOrder
+    {
+        $oldStatus = null;
+        $updatedOrder = DB::transaction(function () use ($order, $newStatus, $user, &$oldStatus) {
+            // Lock order for update to prevent race conditions and concurrent transitions (Idempotency)
+            $lockedOrder = SalesOrder::lockForUpdate()->findOrFail($order->id);
+            $currentStatus = $lockedOrder->status;
+            $oldStatus = $currentStatus;
+
+            if ($currentStatus === $newStatus) {
+                return $lockedOrder;
+            }
+
+            // ١. دڵنیابوونەوە لەوەی کە گواستنەوەکە یاساییە بەپێی نەخشەی گواستنەوەی دۆخەکان
+            if (!isset($this->validTransitions[$currentStatus]) || !in_array($newStatus, $this->validTransitions[$currentStatus])) {
+                throw ValidationException::withMessages([
+                    'status' => "گواستنەوەی دۆخەکە نادروستە. ناتوانرێت لە دۆخی {$currentStatus} بگۆڕدرێت بۆ {$newStatus}."
+                ]);
+            }
+
+            // ٢. سەپاندنی دەسەڵاتەکان و مۆڵەتەکان بەپێی دۆخی نوێ لەناو خودی سێرڤسەکەدا بۆ پاراستنی هێمنیی سیستەمەکە
+            if (in_array($newStatus, [SalesOrder::STATUS_DRAFT, SalesOrder::STATUS_CONFIRMED, SalesOrder::STATUS_PACKING])) {
+                if (!$user->hasPermission('orders.create') && !$user->hasPermission('stock.pack')) {
+                    throw ValidationException::withMessages([
+                        'status' => 'تۆ ڕێگەپێدراو نیت بۆ گۆڕینی دۆخی پسوڵە بۆ ' . $newStatus
+                    ]);
+                }
+            } elseif ($newStatus === SalesOrder::STATUS_READY) {
+                if (!$user->hasPermission('stock.pack')) {
+                    throw ValidationException::withMessages([
+                        'status' => 'تۆ ڕێگەپێدراو نیت بۆ گۆڕینی دۆخی پسوڵە بۆ ' . $newStatus
+                    ]);
+                }
+            } elseif (in_array($newStatus, [SalesOrder::STATUS_IN_DELIVERY, SalesOrder::STATUS_DELIVERED])) {
+                if (!$user->hasPermission('delivery.update')) {
+                    throw ValidationException::withMessages([
+                        'status' => 'تۆ ڕێگەپێدراو نیت بۆ گۆڕینی دۆخی پسوڵە بۆ ' . $newStatus
+                    ]);
+                }
+            } elseif ($newStatus === SalesOrder::STATUS_CANCELLED) {
+                $canCancel = $user->hasPermission('orders.create')
+                    || ($user->hasPermission('stock.pack') && ($currentStatus === SalesOrder::STATUS_CONFIRMED || $currentStatus === SalesOrder::STATUS_PACKING || $currentStatus === SalesOrder::STATUS_READY))
+                    || ($user->hasPermission('delivery.update') && $currentStatus === SalesOrder::STATUS_IN_DELIVERY)
+                    || $user->isAdmin()
+                    || $user->isOwner();
+
+                if (!$canCancel) {
+                    throw ValidationException::withMessages([
+                        'status' => 'تۆ ڕێگەپێدراو نیت بۆ هەڵوەشاندنەوەی ئەم پسوڵەیە.'
+                    ]);
+                }
+
+                // ڕێگری لە هەڵوەشاندنەوەی پسوڵەیەک کە کۆمسیۆنی چالاکی بۆ هەژمارکراوە
+                $hasActiveCommission = \App\Models\SalesmanCommissionDetail::where('sales_order_id', $lockedOrder->id)
+                    ->whereHas('commission', function ($q) {
+                        $q->whereIn('status', [
+                            \App\Models\SalesmanCommission::STATUS_CALCULATED,
+                            \App\Models\SalesmanCommission::STATUS_APPROVED,
+                            \App\Models\SalesmanCommission::STATUS_PAID,
+                        ]);
+                    })
+                    ->exists();
+
+                if ($hasActiveCommission) {
+                    throw ValidationException::withMessages([
+                        'status' => 'ناتوانرێت پسوڵە هەڵبوەشێنرێتەوە چونکە لە کۆمسیۆنێکی چالاکدا بەکارهاتووە. تکایە سەرەتا کۆمسیۆنەکە هەڵوەشێنەرەوە.',
+                    ]);
+                }
+            }
+
+            // ٣. ئەنجامدانی کردارە لۆجیکییە پەیوەندیدارەکان بە هەر دۆخێکەوە
+            switch ($newStatus) {
+                case SalesOrder::STATUS_CONFIRMED:
+                    $this->reserveStock($lockedOrder, $user);
+                    $lockedOrder->confirmed_at = now();
+                    break;
+
+                case SalesOrder::STATUS_PACKING:
+                    if ($oldStatus === SalesOrder::STATUS_DRAFT) {
+                        $this->reserveStock($lockedOrder, $user);
+                        $lockedOrder->confirmed_at = now();
+                    }
+                    break;
+
+                case SalesOrder::STATUS_READY:
+                    // If transitioning directly to READY, auto-mark all items as packed if none are already packed!
+                    if (in_array($oldStatus, [SalesOrder::STATUS_CONFIRMED, SalesOrder::STATUS_PACKING])) {
+                        $hasPacked = $lockedOrder->items()->where('is_packed', true)->exists();
+                        if (!$hasPacked) {
+                            $lockedOrder->items()->update(['is_packed' => true]);
+                        }
+                    }
+
+                    // Count packed items
+                    $packedCount = $lockedOrder->items()->where('is_packed', true)->count();
+                    if ($packedCount === 0) {
+                        throw ValidationException::withMessages(['status' => 'ناتوانرێت پسوڵە بە ئامادەکراو دابنرێت ئەگەر هیچ کاڵایەکی پاکەت نەکراوە.']);
+                    }
+
+                    // Handle unpacked items (partial packing) in deterministic order of product_id ASC to prevent deadlocks
+                    $unpackedItems = $lockedOrder->items()->where('is_packed', false)->orderBy('product_id', 'asc')->get();
+                    foreach ($unpackedItems as $item) {
+                        $warehouseStock = WarehouseStock::lockForUpdate()->where([
+                            'warehouse_id' => $lockedOrder->warehouse_id,
+                            'product_id' => $item->product_id
+                        ])->first();
+
+                        if ($warehouseStock) {
+                            $warehouseStock->releaseStock($item->quantity, $user->id, 'sales_order', $lockedOrder->id, 'Partial packing release');
+                        }
+                        $item->delete();
+                    }
+
+                    // Recalculate order totals if any items were deleted
+                    if ($unpackedItems->count() > 0) {
+                        $remainingItems = $lockedOrder->items()->where('is_packed', true)->get();
+                        $subtotal = 0;
+                        $totalProfit = 0;
+                        foreach ($remainingItems as $item) {
+                            $subtotal += $item->line_total;
+                            $totalProfit += $item->profit;
+                        }
+
+                        $permDiscountAmount = 0;
+                        if ($lockedOrder->permanent_discount_percent > 0) {
+                            $permDiscountAmount = (int) round(($subtotal * $lockedOrder->permanent_discount_percent) / 100);
+                        }
+                        $amountAfterPermDiscount = max(0, $subtotal - $permDiscountAmount);
+
+                        $invoiceDiscountAmount = 0;
+                        if ($lockedOrder->discount_type === 'FIXED') {
+                            $invoiceDiscountAmount = min($amountAfterPermDiscount, (int) $lockedOrder->discount_amount);
+                        } elseif ($lockedOrder->discount_percent > 0) {
+                            $invoiceDiscountAmount = (int) round(($amountAfterPermDiscount * $lockedOrder->discount_percent) / 100);
+                        }
+                        $totalAmount = max(0, $amountAfterPermDiscount - $invoiceDiscountAmount);
+                        $netTotalProfit = $totalProfit - $permDiscountAmount - $invoiceDiscountAmount;
+
+                        $lockedOrder->update([
+                            'subtotal' => $subtotal,
+                            'permanent_discount_amount' => $permDiscountAmount,
+                            'discount_amount' => $invoiceDiscountAmount,
+                            'total_amount' => $totalAmount,
+                            'total_profit' => $netTotalProfit,
+                        ]);
+                    }
+
+                    $lockedOrder->ready_at = now();
+                    break;
+
+                case SalesOrder::STATUS_IN_DELIVERY:
+                    break;
+
+                case SalesOrder::STATUS_DELIVERED:
+                    $this->finalizeStockSale($lockedOrder, $user);
+                    $this->postToCustomerLedger($lockedOrder, $user);
+                    $lockedOrder->delivered_at = now();
+                    // Delivery Synchronization
+                    $this->syncDeliveryOnDelivery($lockedOrder);
+                    break;
+
+                case SalesOrder::STATUS_CANCELLED:
+                    // Only release stock if it was actually reserved (i.e. status was CONFIRMED, PACKING, READY, or IN_DELIVERY)
+                    if (in_array($currentStatus, [SalesOrder::STATUS_CONFIRMED, SalesOrder::STATUS_PACKING, SalesOrder::STATUS_READY, SalesOrder::STATUS_IN_DELIVERY])) {
+                        $this->releaseStock($lockedOrder, $user);
+                    }
+                    // Close any open purchase requirements linked to this cancelled order
+                    PurchaseRequirement::where('sales_order_id', $lockedOrder->id)
+                        ->where('status', 'OPEN')
+                        ->update(['status' => 'CLOSED']);
+                    // Delivery Synchronization
+                    $this->syncDeliveryOnCancellation($lockedOrder);
+                    break;
+
+                default:
+                    throw ValidationException::withMessages(['status' => 'دۆخێکی نەناسراو دیاریکراوە.']);
+            }
+
+            // ئەگەر پسوڵەکە لێرە ئەبدەیت کرا
+            $lockedOrder->status = $newStatus;
+            $lockedOrder->save();
+
+            // تۆمارکردنی مێژووی چالاکی بۆ سیستەم (Audit Logging)
+            $this->logActivity($lockedOrder, $currentStatus, $newStatus, $user);
+
+            return $lockedOrder;
+        });
+
+        if ($oldStatus !== $newStatus) {
+            if ($newStatus === SalesOrder::STATUS_READY) {
+                try {
+                    app(NotificationService::class)->notifyOrderReadyForDelivery($updatedOrder, $user);
+                } catch (\Throwable $e) {
+                    \Illuminate\Support\Facades\Log::warning("Notification dispatch failed for ready order: " . $e->getMessage());
+                }
+            }
+        }
+
+        try {
+            event(new \App\Events\SalesOrderUpdated($updatedOrder, 'status_change'));
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning("Event broadcast failed for order status change: " . $e->getMessage());
+        }
+
+        return $updatedOrder;
+    }
+
+    /**
+     * حجزکردنی ستۆک لە کۆگا لە کاتی CONFIRMED
+     */
+    private function reserveStock(SalesOrder $order, $user): void
+    {
+        // Sort items deterministically by product_id ASC to eliminate deadlock risks
+        $sortedItems = $order->items->sortBy('product_id');
+        foreach ($sortedItems as $item) {
+            // قفڵکردنی ڕیزی ستۆک بۆ ڕێگری لە کێبڕکێی هاوکات
+            $warehouseStock = WarehouseStock::lockForUpdate()->firstOrCreate(
+                ['warehouse_id' => $order->warehouse_id, 'product_id' => $item->product_id],
+                ['quantity' => 0, 'reserved_quantity' => 0]
+            );
+
+            $availableStock = $warehouseStock->quantity - $warehouseStock->reserved_quantity;
+
+            if ($availableStock < $item->quantity) {
+                // یاسای BR-O01 و BR-O02: کەمبوونی ستۆک دەنێردرێت بۆ کڕین لە بازاڕ (Purchase Requirements)
+                $shortage = $item->quantity - max(0, $availableStock);
+
+                $existingReq = PurchaseRequirement::where('product_id', $item->product_id)
+                    ->where('sales_order_id', $order->id)
+                    ->whereIn('status', ['OPEN', 'ORDERED'])
+                    ->first();
+
+                if ($existingReq) {
+                    if ($existingReq->status === 'OPEN') {
+                        $existingReq->update([
+                            'required_quantity' => $shortage,
+                            'current_stock' => $warehouseStock->quantity,
+                        ]);
+                    } elseif ($existingReq->status === 'ORDERED') {
+                        $additionalShortage = $shortage - $existingReq->required_quantity;
+                        if ($additionalShortage > 0) {
+                            $product = Product::find($item->product_id);
+                            PurchaseRequirement::create([
+                                'product_id' => $item->product_id,
+                                'warehouse_id' => $order->warehouse_id,
+                                'supplier_id' => $product ? $product->supplier_id : null,
+                                'sales_order_id' => $order->id,
+                                'required_quantity' => $additionalShortage,
+                                'current_stock' => $warehouseStock->quantity,
+                                'status' => 'OPEN',
+                                'created_by' => $user->id,
+                            ]);
+                        }
+                    }
+                } else {
+                    $product = Product::find($item->product_id);
+                    PurchaseRequirement::create([
+                        'product_id' => $item->product_id,
+                        'warehouse_id' => $order->warehouse_id,
+                        'supplier_id' => $product ? $product->supplier_id : null,
+                        'sales_order_id' => $order->id,
+                        'required_quantity' => $shortage,
+                        'current_stock' => $warehouseStock->quantity,
+                        'status' => 'OPEN',
+                        'created_by' => $user->id,
+                    ]);
+                }
+
+                $reservedToAdd = max(0, $availableStock);
+            } else {
+                $reservedToAdd = $item->quantity;
+            }
+
+            if ($reservedToAdd > 0) {
+                $warehouseStock->reserveStock($reservedToAdd, $user->id, 'sales_order', $order->id);
+            }
+        }
+    }
+
+    /**
+     * کەمکردنەوەی فیزیکی کاڵا لە کاتی DELIVERED (کۆتاییهاتنی فرۆشتن)
+     */
+    private function finalizeStockSale(SalesOrder $order, $user): void
+    {
+        // Sort items deterministically by product_id ASC to eliminate deadlock risks
+        $sortedItems = $order->items->sortBy('product_id');
+        foreach ($sortedItems as $item) {
+            // ١. قفڵکردنی ڕیزی ستۆکی پەیوەندیدار (Step 1: Lock the stock row)
+            $warehouseStock = WarehouseStock::lockForUpdate()->where([
+                'warehouse_id' => $order->warehouse_id,
+                'product_id' => $item->product_id
+            ])->first();
+
+            if (!$warehouseStock) {
+                // ٦. ئەگەر کاڵاکە لەم کۆگایەدا نەبوو (Step 6: Throw validation exception if record doesn't exist)
+                throw ValidationException::withMessages([
+                    'stock' => "کاڵای ژمارە {$item->product_id} لەم کۆگایەدا بوونی نییە."
+                ]);
+            }
+
+            // ٢. سەرلەنوێ خوێندنەوەی بڕی فیزیکی بە شێوەی باوەڕپێکراو (Step 2: Re-read authoritative current quantity)
+            $currentQty = $warehouseStock->quantity;
+
+            // ٣. سەرلەنوێ خوێندنەوەی بڕی حجزکراو (Step 3: Re-read authoritative reserved quantity)
+            $reservedQty = $warehouseStock->reserved_quantity;
+
+            // ٤. هەژمارکردنی بڕی فیزیکی نوێ دوای کەمکردنەوە (Step 4: Calculate new quantity)
+            $newQty = $currentQty - $item->quantity;
+
+            // ٥. پشکنینی دروستیی گۆڕانکاری داواکراو (Step 5: Validate requested deduction)
+            if ($newQty < 0) {
+                // ٦. هەڵدانی هەڵەی بازرگانی لە کاتی نەبوونی ستۆک (Step 6: Throw business validation exception)
+                throw ValidationException::withMessages([
+                    'stock' => "بڕی پێویست لە ستۆکی فیزیکی کۆگا بەردەست نییە بۆ جێبەجێکردنی فرۆشتن. کاڵا: {$item->product_id}، بەردەست: {$currentQty}، داواکراو: {$item->quantity}"
+                ]);
+            }
+
+            // ٧. ئەنجامدانی کردارەکە پاش سەرکەوتنی پشکنینەکان (Step 7: Only then modify stock)
+            $warehouseStock->adjustStock(
+                -$item->quantity,
+                'DELIVERY',
+                $user->id,
+                'sales_order',
+                $order->id
+            );
+        }
+    }
+
+    /**
+     * ئازادکردنی بڕی حجزکراو لە کاتی CANCELLED
+     */
+    private function releaseStock(SalesOrder $order, $user): void
+    {
+        // Sort items deterministically by product_id ASC to eliminate deadlock risks
+        $sortedItems = $order->items->sortBy('product_id');
+        foreach ($sortedItems as $item) {
+            $warehouseStock = WarehouseStock::lockForUpdate()->where([
+                'warehouse_id' => $order->warehouse_id,
+                'product_id' => $item->product_id
+            ])->first();
+
+            if ($warehouseStock) {
+                $warehouseStock->releaseStock($item->quantity, $user->id, 'sales_order', $order->id);
+            }
+        }
+    }
+
+    /**
+     * تۆمارکردنی پسوڵەی فرۆشتن لە دەفتەری دارایی کڕیار (Customer Ledger)
+     */
+    private function postToCustomerLedger(SalesOrder $order, $user): void
+    {
+        $customer = Customer::lockForUpdate()->findOrFail($order->customer_id);
+
+        $previousBalance = $customer->current_balance;
+        $newBalance = $previousBalance + $order->total_amount;
+
+        CustomerLedger::create([
+            'customer_id' => $customer->id,
+            'entry_type' => 'SALE',
+            'type' => 'debit',
+            'debit' => $order->total_amount,
+            'credit' => 0,
+            'amount' => $order->total_amount,
+            'balance_before' => $previousBalance,
+            'balance_after' => $newBalance,
+            'reference_type' => 'sales_order',
+            'reference_id' => $order->id,
+            'description' => "پسوڵەی فرۆشتنی ژمارە {$order->order_number}",
+            'created_by' => $user->id,
+        ]);
+
+        $customer->update(['current_balance' => $newBalance]);
+    }
+
+    /**
+     * فلتەرکردنی پاراستنی یەکپارچەیی فرۆشتن (Idempotency Helper)
+     */
+    private function checkIdempotency(int $customerId, int $warehouseId, array $items): ?SalesOrder
+    {
+        $recentOrder = SalesOrder::where('customer_id', $customerId)
+            ->where('warehouse_id', $warehouseId)
+            ->where('created_at', '>=', now()->subSeconds(90))
+            ->orderBy('id', 'desc')
+            ->first();
+
+        if ($recentOrder) {
+            $existingItems = $recentOrder->items()->pluck('quantity', 'product_id')->toArray();
+            $newItems = [];
+            foreach ($items as $item) {
+                $newItems[$item['product_id']] = $item['quantity'];
+            }
+
+            if ($existingItems === $newItems) {
+                return $recentOrder;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * دڵنیابوونەوە لە دەستنیشانکردنی کڕیار بۆ مەندوب
+     */
+    private function checkCustomerAssignment(Customer $customer, $user): void
+    {
+        if ($customer->id == 0) {
+            return;
+        }
+
+        if ($user->isAdmin() || $user->isOwner()) {
+            return;
+        }
+
+        // دیاریکردنی ڕاستەوخۆ
+        $hasDirectAssignment = DB::table('customer_assignments')
+            ->where('customer_id', $customer->id)
+            ->where('salesman_id', $user->id)
+            ->where('assigned_from', '<=', now()->toDateString())
+            ->where(function ($q) {
+                $q->whereNull('assigned_until')
+                  ->orWhere('assigned_until', '>=', now()->toDateString());
+            })
+            ->exists();
+
+        if ($hasDirectAssignment) {
+            return;
+        }
+
+        // دیاریکردنی بەپێی گەڕەک (Route)
+        $hasRouteAssignment = DB::table('route_salesmen')
+            ->where('route_id', $customer->route_id)
+            ->where('salesman_id', $user->id)
+            ->where(function ($q) {
+                $q->where('is_active', true)
+                  ->orWhere('work_date', now()->toDateString());
+            })
+            ->exists();
+
+        if ($hasRouteAssignment) {
+            return;
+        }
+
+        throw ValidationException::withMessages([
+            'customer_id' => 'ڕێگەپێدراو نییە. ئەم کڕیارە بۆ ئەم مەندوبە دەستنیشان نەکراوە.'
+        ]);
+    }
+
+    /**
+     * تۆمارکردنی دەفتەری مێژوویی کار چالاکییەکان (Audit activity log)
+     */
+    private function logActivity(SalesOrder $order, ?string $oldStatus, string $newStatus, $user): void
+    {
+        $description = $oldStatus 
+            ? "دۆخی پسوڵەی فرۆشتن {$order->order_number} گۆڕدرا لە [{$oldStatus}] بۆ [{$newStatus}]"
+            : "پسوڵەی فرۆشتنی نوێ {$order->order_number} دروستکرا بە دۆخی [{$newStatus}]";
+
+        app(AuditService::class)->log([
+            'action'      => 'STATUS_CHANGE',
+            'entity_type' => 'SalesOrder',
+            'entity_id'   => $order->id,
+            'table_name'  => 'sales_orders',
+            'old_values'  => [
+                'status'       => $oldStatus,
+                'order_number' => $order->order_number,
+            ],
+            'new_values'  => [
+                'status'       => $newStatus,
+                'order_number' => $order->order_number,
+                'total_amount' => $order->total_amount,
+            ],
+            'description' => $description,
+            'user'        => $user,
+        ]);
+    }
+
+    /**
+     * Synchronize delivery trip orders when sales order is delivered directly
+     */
+    private function syncDeliveryOnDelivery(SalesOrder $order): void
+    {
+        DB::table('delivery_trip_orders')
+            ->where('sales_order_id', $order->id)
+            ->where('status', 'PENDING')
+            ->update([
+                'status' => 'DELIVERED',
+                'delivered_at' => now(),
+                'received_amount' => $order->total_amount,
+            ]);
+    }
+
+    /**
+     * Synchronize delivery trip orders when sales order is cancelled
+     */
+    private function syncDeliveryOnCancellation(SalesOrder $order): void
+    {
+        DB::table('delivery_trip_orders')
+            ->where('sales_order_id', $order->id)
+            ->whereIn('status', ['PENDING', 'DELIVERED'])
+            ->update([
+                'status' => 'FAILED',
+                'failed_reason' => 'Cancelled via Sales Order',
+            ]);
+    }
+
+    /**
+     * Cooperative dual-entry update of a shared order identity.
+     * Integrates optimistic locking (versioning) and robust validation.
+     */
+    public function updateSharedOrder(SalesOrder $order, array $data, $user): SalesOrder
+    {
+        return DB::transaction(function () use ($order, $data, $user) {
+            // Lock order for update to prevent concurrent race conditions
+            $order = SalesOrder::lockForUpdate()->findOrFail($order->id);
+
+            // Status consistency check: Shared order can only be edited while it is in PACKING or DRAFT status
+            if (!in_array($order->status, [SalesOrder::STATUS_PACKING, SalesOrder::STATUS_DRAFT])) {
+                throw new \RuntimeException('ناتوانرێت دەستکاری پسوڵەی هاوبەش بکرێت چونکە پێشتر ئامادەکراوە یان لە پرۆسەدایە.');
+            }
+
+            // Concurrent edit validation (optimistic locking / stale client check)
+            $clientVersion = isset($data['version']) ? (int) $data['version'] : null;
+            if ($clientVersion !== null && $order->version !== $clientVersion) {
+                throw new \App\Exceptions\ConcurrencyConflictException($order);
+            }
+
+            // Lock customer row
+            $customer = $this->getCustomerForOrder($data['customer_id']);
+            $this->checkCustomerAssignment($customer, $user);
+
+            // ئەگەر لە دۆخی PACKING بوو، ستۆک ئازاد دەکەین پێش سڕینەوەی ئایتمە کۆنەکان
+            if ($order->status === SalesOrder::STATUS_PACKING) {
+                $this->releaseStock($order, $user);
+            }
+
+            // Clear old items
+            $order->items()->forceDelete();
+
+            $subtotal = 0;
+            $totalProfit = 0;
+
+            foreach ($data['items'] ?? [] as $item) {
+                $quantity = (int) $item['quantity'];
+                if ($quantity <= 0) {
+                    throw ValidationException::withMessages([
+                        'items' => 'بڕی کاڵا دەبێت لە ١ کەمتر نەبێت.'
+                    ]);
+                }
+
+                $product = Product::findOrFail($item['product_id']);
+
+                if (isset($data['price_type'])) {
+                    $requestedType = strtoupper($data['price_type']);
+                    $priceType = in_array($requestedType, ['N1', 'N2', 'N3']) ? $requestedType : 'N3';
+                    $unitPrice = (int) $product->getPriceForType($priceType);
+                } else {
+                    $priceDetails = $customer->getPriceDetailsForProduct($product);
+                    $unitPrice = (int) $priceDetails['price'];
+                    $priceType = $priceDetails['price_type'];
+                }
+                $costPrice = (int) $product->cost_price;
+
+                $lineTotal = $unitPrice * $quantity;
+                $profit = ($unitPrice - $costPrice) * $quantity;
+
+                $order->items()->create([
+                    'product_id' => $product->id,
+                    'quantity' => $quantity,
+                    'unit_price' => $unitPrice,
+                    'cost_price' => $costPrice,
+                    'price_type' => $priceType,
+                    'discount_percent' => 0,
+                    'discount_amount' => 0,
+                    'line_total' => $lineTotal,
+                    'total_price' => $lineTotal,
+                    'profit' => $profit,
+                    'is_packed' => false,
+                    'notes' => $item['notes'] ?? null,
+                ]);
+
+                $subtotal += $lineTotal;
+                $totalProfit += $profit;
+            }
+
+            $permDiscountPercent = max(0, min(100, (float) ($customer->permanent_discount ?? 0)));
+            $permDiscountAmount = 0;
+            if ($permDiscountPercent > 0) {
+                $permDiscountAmount = (int) round(($subtotal * $permDiscountPercent) / 100);
+            }
+            $amountAfterPermDiscount = max(0, $subtotal - $permDiscountAmount);
+
+            $discountType = strtoupper($data['discount_type'] ?? 'PERCENT');
+            $invoiceDiscountPercent = isset($data['discount_percent']) ? max(0, min(100, (float) $data['discount_percent'])) : 0.0;
+            $invoiceDiscountAmount = 0;
+
+            if ($discountType === 'FIXED' || (isset($data['discount_amount']) && (int)$data['discount_amount'] > 0 && $invoiceDiscountPercent == 0)) {
+                $discountType = 'FIXED';
+                $fixedAmount = (int) ($data['discount_amount'] ?? 0);
+                $invoiceDiscountAmount = min($amountAfterPermDiscount, max(0, $fixedAmount));
+            } elseif ($invoiceDiscountPercent > 0) {
+                $discountType = 'PERCENT';
+                $invoiceDiscountAmount = (int) round(($amountAfterPermDiscount * $invoiceDiscountPercent) / 100);
+            }
+
+            $totalAmount = max(0, $amountAfterPermDiscount - $invoiceDiscountAmount);
+            $netTotalProfit = $totalProfit - $permDiscountAmount - $invoiceDiscountAmount;
+
+            // Increment version and save order
+            $order->update([
+                'customer_id' => $customer->id,
+                'warehouse_id' => $data['warehouse_id'],
+                'notes' => $data['notes'] ?? $order->notes,
+                'subtotal' => $subtotal,
+                'permanent_discount_percent' => $permDiscountPercent,
+                'permanent_discount_amount' => $permDiscountAmount,
+                'discount_percent' => $invoiceDiscountPercent,
+                'discount_amount' => $invoiceDiscountAmount,
+                'discount_type' => $discountType,
+                'total_amount' => $totalAmount,
+                'total_profit' => $netTotalProfit,
+                'version' => $order->version + 1,
+            ]);
+
+            // ئەگەر لە PACKING بوو، ستۆک بۆ ئایتمە نوێکراوەکان حجز دەکەینەوە
+            if ($order->status === SalesOrder::STATUS_PACKING) {
+                $this->reserveStock($order, $user);
+            }
+
+            $requestedStatus = $data['status'] ?? $order->status;
+            if ($requestedStatus !== $order->status && !in_array($requestedStatus, [SalesOrder::STATUS_DRAFT, SalesOrder::STATUS_PACKING])) {
+                $order = $this->transitionTo($order, $requestedStatus, $user);
+            }
+
+            return $order;
+        });
+
+        try {
+            event(new \App\Events\SalesOrderUpdated($updatedOrder, 'update'));
+            $this->dispatchOrderNotification($updatedOrder, $user);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning("Event broadcast failed for shared order update: " . $e->getMessage());
+        }
+
+        return $updatedOrder;
+    }
+
+    /**
+     * Helper to safely get or create Customer for order creation/updates (including temporary customer ID 0)
+     */
+    private function getCustomerForOrder($customerId): Customer
+    {
+        $id = (int) $customerId;
+        if ($id === 0) {
+            $customer = Customer::where('id', 0)->first();
+            if (!$customer) {
+                $defaultRoute = \App\Models\Route::firstOrCreate(
+                    ['name' => 'گشتی'],
+                    ['color' => '#888888', 'is_active' => true]
+                );
+                \Illuminate\Support\Facades\DB::statement('SET SESSION sql_mode = "NO_AUTO_VALUE_ON_ZERO";');
+                $customer = Customer::create([
+                    'id' => 0,
+                    'name' => 'کڕیاری کاتی (بێ ناو)',
+                    'phone' => '00000000000',
+                    'route_id' => $defaultRoute->id,
+                    'price_type' => 'N3',
+                    'current_balance' => 0,
+                    'is_active' => true,
+                ]);
+            }
+            return $customer;
+        }
+
+        return Customer::lockForUpdate()->findOrFail($id);
+    }
+
+    /**
+     * Helper to dispatch warehouse notification when order contains items and has not been notified yet
+     */
+    private function dispatchOrderNotification(SalesOrder $order, $user): void
+    {
+        try {
+            app(NotificationService::class)->notifyNewOrderCreated($order, $user);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning("Notification dispatch failed for order #{$order->id}: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * سڕینەوەی پسوڵەی فرۆشتن بە شێوەیەکی سەلامەت و ئازادکردنی ستۆک
+     */
+    public function deleteOrder(SalesOrder $order, $user): void
+    {
+        DB::transaction(function () use ($order, $user) {
+            $lockedOrder = SalesOrder::lockForUpdate()->findOrFail($order->id);
+
+            // Limit deletion of completed/delivered/in-delivery orders to preserve integrity
+            if (in_array($lockedOrder->status, [SalesOrder::STATUS_IN_DELIVERY, SalesOrder::STATUS_DELIVERED])) {
+                throw ValidationException::withMessages([
+                    'status' => 'ناتوانرێت پسوڵەیەک بسڕێتەوە کە لە ڕێگەی گەیاندندایە یان گەیشتووە.'
+                ]);
+            }
+
+            // Only release stock if it was actually reserved
+            if (in_array($lockedOrder->status, [SalesOrder::STATUS_CONFIRMED, SalesOrder::STATUS_PACKING, SalesOrder::STATUS_READY])) {
+                $this->releaseStock($lockedOrder, $user);
+            }
+
+            // Close linked purchase requirements
+            PurchaseRequirement::where('sales_order_id', $lockedOrder->id)
+                ->where('status', 'OPEN')
+                ->update(['status' => 'CLOSED']);
+
+            // Soft delete the order
+            $lockedOrder->delete();
+
+            // Log the activity
+            app(AuditService::class)->log([
+                'action'      => 'DELETE',
+                'entity_type' => 'SalesOrder',
+                'entity_id'   => $lockedOrder->id,
+                'table_name'  => 'sales_orders',
+                'old_values'  => [
+                    'order_number' => $lockedOrder->order_number,
+                    'status'       => $lockedOrder->status,
+                    'total_amount' => $lockedOrder->total_amount,
+                ],
+                'new_values'  => [],
+                'description' => "پسوڵەی فرۆشتنی ژمارە {$lockedOrder->order_number} سڕایەوە (Soft Delete)",
+                'user'        => $user,
+            ]);
+        });
+
+        // Dispatch order deletion notification to salesman and admins/owner
+        try {
+            app(NotificationService::class)->notifyOrderDeleted($order, $user);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning("Notification dispatch failed for order deletion: " . $e->getMessage());
+        }
+
+        try {
+            event(new \App\Events\SalesOrderUpdated($order, 'delete'));
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning("Event broadcast failed for order deletion: " . $e->getMessage());
+        }
+    }
+}

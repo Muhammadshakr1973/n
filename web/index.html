@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ku">
+<head>
+  <base href="/">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="Comprehensive Distribution and Inventory ERP with Laravel REST backend and Flutter client">
+  <meta property="og:title" content="GARDI ERP">
+  <meta property="og:description" content="Comprehensive Distribution and Inventory ERP with Laravel REST backend and Flutter client">
+
+  <!-- iOS meta tags & icons -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="GARDI ERP">
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" href="favicon.png"/>
+
+  <title>GARDI ERP</title>
+  <link rel="manifest" href="manifest.json">
+
+  <!-- Pusher Channels JavaScript SDK required by pusher_channels_flutter on Web -->
+  <script src="https://js.pusher.com/8.2.0/pusher.min.js"></script>
+
+  <!-- Preload ZXing Barcode Scanning Library to eliminate camera initialization delay -->
+  <script id="mobile-scanner-barcode-reader" src="https://unpkg.com/@zxing/library@0.21.3"></script>
+
+  <style>
+    /* Fix Platform View and Camera Video positioning for Fullscreen Viewfinder */
+    flt-platform-view,
+    flutter-platform-view {
+      direction: ltr !important;
+      overflow: hidden !important;
+    }
+    flt-platform-view video,
+    flutter-platform-view video,
+    video {
+      direction: ltr !important;
+      object-fit: cover !important;
+      width: 100% !important;
+      height: 100% !important;
+      max-width: 100% !important;
+      max-height: 100% !important;
+    }
+  </style>
+
+  <!-- Modern Flutter Web Initialization -->
+  <script>
+    window._flutter = window._flutter || {};
+    window._flutter.buildConfig = window._flutter.buildConfig || {
+      builds: [
+        {
+          compileTarget: 'dart2js',
+          renderer: 'canvaskit',
+          mainImport: 'main.dart.js'
+        }
+      ]
+    };
+  </script>
+  <script src="flutter.js" defer></script>
+</head>
+<body>
+  <script>
+    window.addEventListener('load', function(ev) {
+      if (window._flutter && window._flutter.loader) {
+        window._flutter.loader.load({
+          config: window._flutter.buildConfig
+        });
+      }
+    });
+  </script>
+</body>
+</html>

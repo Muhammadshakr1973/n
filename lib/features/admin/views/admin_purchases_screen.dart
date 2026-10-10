@@ -1,0 +1,1286 @@
+import 'package:pos_app/core/utils/formatters.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../core/components/app_card.dart';
+import '../../../core/components/app_text_field.dart';
+import '../../../core/components/status_badge.dart';
+import '../../../core/components/app_dialog.dart';
+import '../../../core/components/app_snackbar.dart';
+import '../../../core/components/permission_guard.dart';
+import '../../../core/theme/app_breakpoints.dart';
+import '../../../core/theme/app_colors.dart';
+import '../../../core/theme/app_icons.dart';
+import '../../../core/theme/app_spacing.dart';
+import '../../../core/theme/app_text_styles.dart';
+import '../../products/models/supplier_model.dart';
+import '../../products/providers/suppliers_provider.dart';
+import '../models/purchase_order_model.dart';
+import '../providers/purchase_provider.dart';
+import '../../products/views/supplier_reconciliation_dialog.dart';
+import 'supplier_form_dialog.dart';
+import '../../auth/providers/auth_provider.dart';
+
+class AdminPurchasesScreen extends ConsumerStatefulWidget {
+  const AdminPurchasesScreen({super.key});
+
+  @override
+  ConsumerState<AdminPurchasesScreen> createState() =>
+      _AdminPurchasesScreenState();
+}
+
+class _AdminPurchasesScreenState extends ConsumerState<AdminPurchasesScreen>
+    with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+  final Set<int> _selectedRequirementIds = {};
+  bool _isConverting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 3, vsync: this);
+    _tabController.addListener(() {
+      setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  void _showAddSupplierDialog(BuildContext context) {
+    showDialog<bool>(
+      context: context,
+      builder: (context) => const SupplierFormDialog(),
+    ).then((success) {
+      if (success == true) {
+        ref.invalidate(suppliersListProvider);
+      }
+    });
+  }
+
+  void _showEditSupplierDialog(BuildContext context, SupplierModel supplier) {
+    showDialog<bool>(
+      context: context,
+      builder: (context) => SupplierFormDialog(supplier: supplier),
+    ).then((success) {
+      if (success == true) {
+        ref.invalidate(suppliersListProvider);
+      }
+    });
+  }
+
+  void _deleteSupplier(SupplierModel supplier) async {
+    final confirmed = await AppDialog.showConfirm(
+      context,
+      title: 'سڕینەوەی کۆمپانیا',
+      message: 'دڵنیایت لە سڕینەوەی کۆمپانیای "${supplier.name}"؟',
+      confirmText: 'سڕینەوە',
+      cancelText: 'پەشیمانبوونەوە',
+      isDanger: true,
+    );
+
+    if (confirmed == true && mounted) {
+      try {
+        await ref.read(supplierActionsProvider).deleteSupplier(supplier.id);
+        if (mounted) {
+          AppSnackbar.show(
+            context,
+            message: 'کۆمپانیا بە سەرکەوتوویی سڕایەوە',
+            type: SnackbarType.success,
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          AppSnackbar.show(
+            context,
+            message: 'کێشە لە سڕینەوە: $e',
+            type: SnackbarType.error,
+          );
+        }
+      }
+    }
+  }
+
+  void _convertSelectedToPO() async {
+    if (_selectedRequirementIds.isEmpty) return;
+
+    final notesController = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text(
+            'دروستکردنی پسوڵەی کڕین',
+            style: AppTextStyles.bodyBold,
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'ئایا دڵنیایت لە گۆڕینی ${_selectedRequirementIds.length} داواکاری بۆ پسوڵەی کڕین؟',
+                style: AppTextStyles.caption,
+              ),
+              const SizedBox(height: AppSpacing.md),
+              TextField(
+                controller: notesController,
+                decoration: const InputDecoration(
+                  labelText: 'تێبینییەکان (ئارەزوومەندانە)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('پاشگەزبوونەوە'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('تۆمارکردن'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed == true && mounted) {
+      setState(() {
+        _isConverting = true;
+      });
+      try {
+        await ref
+            .read(purchaseActionsProvider)
+            .convertRequirementsToPO(
+              requirementIds: _selectedRequirementIds.toList(),
+              notes: notesController.text,
+            );
+        setState(() {
+          _selectedRequirementIds.clear();
+        });
+        if (mounted) {
+          AppSnackbar.show(
+            context,
+            message: 'داواکارییەکان بە سەرکەوتوویی گۆڕدران بۆ پسوڵەی کڕین',
+            type: SnackbarType.success,
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          AppSnackbar.show(
+            context,
+            message: e.toString().replaceAll('Exception: ', ''),
+            type: SnackbarType.error,
+          );
+        }
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isConverting = false;
+          });
+        }
+      }
+    }
+  }
+
+  void _confirmPO(PurchaseOrderModel order) async {
+    final confirmed = await AppDialog.showConfirm(
+      context,
+      title: 'پەسەندکردنی پسوڵەی کڕین',
+      message:
+          'ئایا دڵنیایت لە پەسەندکردنی پسوڵەی کڕینی #${order.orderNumber}؟',
+      confirmText: 'پەسەندکردن',
+      cancelText: 'پەشیمانبوونەوە',
+    );
+
+    if (confirmed == true && mounted) {
+      try {
+        await ref.read(purchaseActionsProvider).confirmPurchaseOrder(order.id);
+        if (mounted) {
+          AppSnackbar.show(
+            context,
+            message: 'پسوڵەی کڕین بەسەرکەوتوویی پەسەندکرا',
+            type: SnackbarType.success,
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          AppSnackbar.show(
+            context,
+            message: e.toString().replaceAll('Exception: ', ''),
+            type: SnackbarType.error,
+          );
+        }
+      }
+    }
+  }
+
+  void _receivePO(PurchaseOrderModel order) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => ReceivePODialog(
+        order: order,
+        actions: ref.read(purchaseActionsProvider),
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      AppSnackbar.show(
+        context,
+        message: 'کرداری وەرگرتنی پسوڵەی کڕین جێبەجێکرا',
+        type: SnackbarType.success,
+      );
+    }
+  }
+
+  void _cancelPO(PurchaseOrderModel order) async {
+    final confirmed = await AppDialog.showConfirm(
+      context,
+      title: 'هەڵوەشاندنەوەی پسوڵەی کڕین',
+      message:
+          'ئایا دڵنیایت لە هەڵوەشاندنەوەی پسوڵەی کڕینی #${order.orderNumber}؟ بەم کارە داواکارییەکان دەگەڕێنەوە لیستی داواکاری کراوە.',
+      confirmText: 'هەڵوەشاندنەوە',
+      cancelText: 'پەشیمانبوونەوە',
+      isDanger: true,
+    );
+
+    if (confirmed == true && mounted) {
+      try {
+        await ref.read(purchaseActionsProvider).cancelPurchaseOrder(order.id);
+        if (mounted) {
+          AppSnackbar.show(
+            context,
+            message: 'پسوڵەی کڕین بەسەرکەوتوویی هەڵوەشێنرایەوە',
+            type: SnackbarType.success,
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          AppSnackbar.show(
+            context,
+            message: e.toString().replaceAll('Exception: ', ''),
+            type: SnackbarType.error,
+          );
+        }
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PermissionGuard(
+      permission: 'suppliers.manage',
+      child: _buildScaffold(context),
+    );
+  }
+
+  Widget _buildScaffold(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('بازاڕ و کۆمپانیا', style: AppTextStyles.h2),
+        actions: [
+          if (_tabController.index == 2)
+            IconButton(
+              icon: const Icon(AppIcons.add),
+              onPressed: () => _showAddSupplierDialog(context),
+            ),
+        ],
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: 'پێویست بۆ کڕین'),
+            Tab(text: 'پسوڵەکانی کڕین'),
+            Tab(text: 'کۆمپانیاکان'),
+          ],
+          labelStyle: AppTextStyles.bodyBold,
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          _buildRequirementsTab(context),
+          _buildPurchaseOrdersTab(context),
+          _buildSuppliersTab(context),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRequirementsTab(BuildContext context) {
+    final reqsAsync = ref.watch(purchaseRequirementsProvider);
+    final groupedAsync = ref.watch(purchaseRequirementsGroupProvider);
+    final theme = Theme.of(context);
+
+    return reqsAsync.when(
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (err, stack) => Center(
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.all(AppSpacing.lg),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.error_outline,
+                size: 64,
+                color: theme.colorScheme.error,
+              ),
+              const SizedBox(height: AppSpacing.md),
+              const Text('کێشەیەک لە بارکردنی داواکارییەکان دروستبوو'),
+              const SizedBox(height: AppSpacing.sm),
+              Text(
+                err.toString().replaceAll('Exception: ', ''),
+                style: AppTextStyles.caption,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: AppSpacing.lg),
+              ElevatedButton.icon(
+                onPressed: () {
+                  ref.invalidate(purchaseRequirementsProvider);
+                  ref.invalidate(purchaseRequirementsGroupProvider);
+                },
+                icon: const Icon(Icons.refresh),
+                label: const Text('دووبارە هەوڵبدەرەوە'),
+              ),
+            ],
+          ),
+        ),
+      ),
+      data: (requirements) {
+        if (requirements.isEmpty) {
+          return RefreshIndicator(
+            onRefresh: () async {
+              ref.invalidate(purchaseRequirementsProvider);
+              ref.invalidate(purchaseRequirementsGroupProvider);
+            },
+            child: SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              child: Container(
+                height: MediaQuery.of(context).size.height * 0.6,
+                alignment: Alignment.center,
+                padding: const EdgeInsets.all(AppSpacing.lg),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.inventory_2_outlined,
+                      size: 80,
+                      color: Colors.grey.shade400,
+                    ),
+                    const SizedBox(height: AppSpacing.md),
+                    Text(
+                      'هیچ داواکاری کڕینێکی کراوە بەردەست نییە',
+                      style: AppTextStyles.bodyBold.copyWith(
+                        color: Colors.grey.shade600,
+                      ),
+                    ),
+                    const SizedBox(height: AppSpacing.sm),
+                    Text(
+                      'کاتێک ستۆک تەواو دەبێت لە کاتی پسوڵەی فرۆشتن، داواکاری لێرە دەردەکەوێت',
+                      style: AppTextStyles.caption,
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }
+
+        return RefreshIndicator(
+          onRefresh: () async {
+            ref.invalidate(purchaseRequirementsProvider);
+            ref.invalidate(purchaseRequirementsGroupProvider);
+          },
+          child: Column(
+            children: [
+              groupedAsync.maybeWhen(
+                data: (groups) {
+                  if (groups.isEmpty) return const SizedBox.shrink();
+                  return Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: AppSpacing.screenHorizontal,
+                      vertical: AppSpacing.xs,
+                    ),
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: [
+                          Text('گرووپی کۆمپانیاکان: ', style: AppTextStyles.caption),
+                          const SizedBox(width: AppSpacing.xs),
+                          ...groups.map((group) {
+                            final String name = group['supplier_name'] ?? 'بێ دابینکەر';
+                            final int count = group['items_count'] ?? 0;
+                            final List reqList = group['requirements'] ?? [];
+
+                            return Padding(
+                              padding: const EdgeInsets.only(right: AppSpacing.xs),
+                              child: ActionChip(
+                                label: Text('$name ($count)', style: AppTextStyles.caption),
+                                onPressed: () {
+                                  setState(() {
+                                    for (var item in reqList) {
+                                      final id = item['id'];
+                                      if (id is int) {
+                                        _selectedRequirementIds.add(id);
+                                      }
+                                    }
+                                  });
+                                },
+                              ),
+                            );
+                          }),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+                orElse: () => const SizedBox.shrink(),
+              ),
+              if (_selectedRequirementIds.isNotEmpty)
+                Container(
+                  padding: const EdgeInsets.all(AppSpacing.md),
+                  color: theme.colorScheme.primaryContainer.withValues(
+                    alpha: 0.3,
+                  ),
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final bool useVerticalLayout = constraints.maxWidth < 420;
+                      if (useVerticalLayout) {
+                        return Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Text(
+                              'هەڵبژێردراو: ${_selectedRequirementIds.length} دانە',
+                              style: AppTextStyles.bodyBold.copyWith(
+                                color: theme.colorScheme.onPrimaryContainer,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(height: AppSpacing.sm),
+                            _isConverting
+                                ? const Center(
+                                    child: SizedBox(
+                                      width: 24,
+                                      height: 24,
+                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                    ),
+                                  )
+                                : ElevatedButton.icon(
+                                    onPressed: _convertSelectedToPO,
+                                    icon: const Icon(Icons.shopping_cart_checkout),
+                                    label: const Text('دروستکردنی پسوڵەی کڕین (PO)'),
+                                  ),
+                          ],
+                        );
+                      }
+                      return Row(
+                        children: [
+                          Text(
+                            'هەڵبژێردراو: ${_selectedRequirementIds.length} دانە',
+                            style: AppTextStyles.bodyBold.copyWith(
+                              color: theme.colorScheme.onPrimaryContainer,
+                            ),
+                          ),
+                          const Spacer(),
+                          _isConverting
+                              ? const SizedBox(
+                                  width: 24,
+                                  height: 24,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : ElevatedButton.icon(
+                                  onPressed: _convertSelectedToPO,
+                                  icon: const Icon(Icons.shopping_cart_checkout),
+                                  label: const Text('دروستکردنی پسوڵەی کڕین (PO)'),
+                                ),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              Expanded(
+                child: ListView.separated(
+                  padding: const EdgeInsets.all(AppSpacing.screenHorizontal),
+                  itemCount: requirements.length,
+                  separatorBuilder: (context, index) =>
+                      const SizedBox(height: AppSpacing.sm),
+                  itemBuilder: (context, index) {
+                    final req = requirements[index];
+                    final isSelected = _selectedRequirementIds.contains(req.id);
+
+                    return AppCard(
+                      child: Row(
+                        children: [
+                          Checkbox(
+                            value: isSelected,
+                            onChanged: (val) {
+                              setState(() {
+                                if (val == true) {
+                                  _selectedRequirementIds.add(req.id);
+                                } else {
+                                  _selectedRequirementIds.remove(req.id);
+                                }
+                              });
+                            },
+                          ),
+                          Container(
+                            width: 44,
+                            height: 44,
+                            decoration: BoxDecoration(
+                              color: req.isUrgent
+                                  ? AppColors.danger.withValues(alpha: 0.1)
+                                  : theme.colorScheme.primaryContainer
+                                        .withValues(alpha: 0.2),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Icon(
+                              req.isUrgent
+                                  ? Icons.warning_amber_rounded
+                                  : Icons.inventory_2_outlined,
+                              color: req.isUrgent
+                                  ? AppColors.danger
+                                  : theme.colorScheme.primary,
+                            ),
+                          ),
+                          const SizedBox(width: AppSpacing.md),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        req.productName,
+                                        style: AppTextStyles.bodyBold,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                    if (req.isUrgent)
+                                      const StatusBadge(
+                                        label: 'بەپەلە',
+                                        type: StatusBadgeType.danger,
+                                      ),
+                                  ],
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  'کۆمپانیا: ${req.supplierName ?? 'بێ کۆمپانیا'} • کۆگا: ${req.warehouseName}',
+                                  style: AppTextStyles.caption,
+                                ),
+                                if (req.salesOrderId != null)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 2.0),
+                                    child: Text(
+                                      'لەلایەن پسوڵەی فرۆشتنی: #${req.salesOrderId}',
+                                      style: AppTextStyles.caption.copyWith(
+                                        color: theme.colorScheme.primary,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: AppSpacing.sm),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              StatusBadge(
+                                label: 'بڕی پێویست: ${req.requiredQuantity}',
+                                type: StatusBadgeType.warning,
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'مەوجود: ${req.currentStock}',
+                                style: AppTextStyles.caption,
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildPurchaseOrdersTab(BuildContext context) {
+    final posAsync = ref.watch(purchaseOrdersProvider);
+    final theme = Theme.of(context);
+
+    return posAsync.when(
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (err, stack) => Center(
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.all(AppSpacing.lg),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.error_outline,
+                size: 64,
+                color: theme.colorScheme.error,
+              ),
+              const SizedBox(height: AppSpacing.md),
+              const Text('کێشەیەک لە بارکردنی پسوڵەکان دروستبوو'),
+              const SizedBox(height: AppSpacing.sm),
+              Text(
+                err.toString().replaceAll('Exception: ', ''),
+                style: AppTextStyles.caption,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: AppSpacing.lg),
+              ElevatedButton.icon(
+                onPressed: () => ref.invalidate(purchaseOrdersProvider),
+                icon: const Icon(Icons.refresh),
+                label: const Text('دووبارە هەوڵبدەرەوە'),
+              ),
+            ],
+          ),
+        ),
+      ),
+      data: (orders) {
+        if (orders.isEmpty) {
+          return RefreshIndicator(
+            onRefresh: () async => ref.invalidate(purchaseOrdersProvider),
+            child: SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              child: Container(
+                height: MediaQuery.of(context).size.height * 0.6,
+                alignment: Alignment.center,
+                padding: const EdgeInsets.all(AppSpacing.lg),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.receipt_long_outlined,
+                      size: 80,
+                      color: Colors.grey.shade400,
+                    ),
+                    const SizedBox(height: AppSpacing.md),
+                    Text(
+                      'هیچ پسوڵەیەکی کڕین تۆمار نەکراوە',
+                      style: AppTextStyles.bodyBold.copyWith(
+                        color: Colors.grey.shade600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }
+
+        return RefreshIndicator(
+          onRefresh: () async => ref.invalidate(purchaseOrdersProvider),
+          child: ListView.separated(
+            padding: const EdgeInsets.all(AppSpacing.screenHorizontal),
+            itemCount: orders.length,
+            separatorBuilder: (context, index) =>
+                const SizedBox(height: AppSpacing.sm),
+            itemBuilder: (context, index) {
+              final order = orders[index];
+              final status = order.status.toUpperCase();
+              final isDraft = status == 'DRAFT';
+              final isConfirmed = status == 'CONFIRMED';
+              final isReceived = status == 'RECEIVED';
+              final isCancelled = status == 'CANCELLED';
+
+              String badgeLabel = 'ڕەشنووس';
+              StatusBadgeType badgeType = StatusBadgeType.warning;
+              if (isConfirmed) {
+                badgeLabel = 'پەسەندکراوە';
+                badgeType = StatusBadgeType.info;
+              } else if (isReceived) {
+                badgeLabel = 'وەرگیراوە';
+                badgeType = StatusBadgeType.success;
+              } else if (isCancelled) {
+                badgeLabel = 'هەڵوەشاوە';
+                badgeType = StatusBadgeType.danger;
+              }
+
+              return AppCard(
+                onTap: isConfirmed ? () => _receivePO(order) : null,
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: CircleAvatar(
+                    backgroundColor: isReceived
+                        ? AppColors.success.withValues(alpha: 0.1)
+                        : (isConfirmed
+                            ? theme.colorScheme.primaryContainer
+                            : theme.colorScheme.surfaceContainerHighest),
+                    child: Icon(
+                      AppIcons.order,
+                      color: isReceived
+                          ? AppColors.success
+                          : theme.colorScheme.primary,
+                    ),
+                  ),
+                  title: Text(
+                    'پسوڵەی کڕین #${order.orderNumber}',
+                    style: AppTextStyles.bodyBold,
+                  ),
+                  subtitle: Text(
+                    '${order.supplierName} • ${order.itemsCount} کاڵا • ${_formatCurrency(order.totalAmount)}',
+                    style: AppTextStyles.caption,
+                  ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      StatusBadge(
+                        label: badgeLabel,
+                        type: badgeType,
+                      ),
+                      if (isDraft)
+                        IconButton(
+                          icon: const Icon(Icons.check_circle_outline, color: AppColors.success),
+                          tooltip: 'پەسەندکردن',
+                          onPressed: () => _confirmPO(order),
+                        ),
+                      if (isConfirmed)
+                        IconButton(
+                          icon: const Icon(Icons.download_done, color: AppColors.success),
+                          tooltip: 'وەرگرتن',
+                          onPressed: () => _receivePO(order),
+                        ),
+                      if (isDraft || isConfirmed)
+                        IconButton(
+                          icon: const Icon(Icons.cancel_outlined, color: AppColors.danger),
+                          tooltip: 'هەڵوەشاندنەوە',
+                          onPressed: () => _cancelPO(order),
+                        ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildSuppliersTab(BuildContext context) {
+    final suppliersAsync = ref.watch(suppliersListProvider);
+
+    return RefreshIndicator(
+      onRefresh: () async => ref.invalidate(suppliersListProvider),
+      child: suppliersAsync.when(
+        data: (suppliers) {
+          if (suppliers.isEmpty) {
+            return LayoutBuilder(
+              builder: (context, constraints) => SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                  child: Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.store_outlined,
+                          size: 64,
+                          color: Theme.of(context).colorScheme.outline,
+                        ),
+                        const SizedBox(height: AppSpacing.md),
+                        const Text(
+                          'هیچ کۆمپانیایەک نییە',
+                          style: AppTextStyles.bodyBold,
+                        ),
+                        const SizedBox(height: AppSpacing.sm),
+                        TextButton.icon(
+                          onPressed: () => _showAddSupplierDialog(context),
+                          icon: const Icon(Icons.add),
+                          label: const Text('زیادکردنی کۆمپانیا'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }
+
+          final screenWidth = MediaQuery.of(context).size.width;
+          int crossAxisCount = 1;
+          if (screenWidth >= 1024) {
+            crossAxisCount = 3;
+          } else if (screenWidth >= 600) {
+            crossAxisCount = 2;
+          }
+
+          final bool isMobileOrTablet = screenWidth < AppBreakpoints.desktopMin;
+
+          return GridView.builder(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(AppSpacing.screenHorizontal),
+            itemCount: suppliers.length,
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: crossAxisCount,
+              crossAxisSpacing: AppSpacing.md,
+              mainAxisSpacing: AppSpacing.sm,
+              mainAxisExtent: isMobileOrTablet ? 124 : 82,
+            ),
+            itemBuilder: (context, index) =>
+                _buildSupplierCard(
+                  context,
+                  suppliers[index],
+                  isMobileOrTablet: isMobileOrTablet,
+                ),
+          );
+        },
+        loading: () => const Center(child: CircularProgressIndicator()),
+        error: (error, stack) => LayoutBuilder(
+          builder: (context, constraints) => SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: constraints.maxHeight),
+              child: Center(
+                child: Text(
+                  'شکست لە هێنانی زانیارییەکان: $error',
+                  style: const TextStyle(color: AppColors.danger),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _formatCurrency(num amount) {
+    return Formatters.currency(amount);
+  }
+
+  Widget _buildSupplierCard(
+    BuildContext context,
+    SupplierModel supplier, {
+    bool isMobileOrTablet = false,
+  }) {
+    final theme = Theme.of(context);
+    final bool hasDebt = supplier.debt > 0;
+    final authState = ref.watch(authProvider);
+    final user = authState.user;
+    final canReconcile = user?.hasPermission('users.manage') ?? false;
+
+    final String phoneText =
+        (supplier.phone != null && supplier.phone!.trim().isNotEmpty)
+            ? supplier.phone!.trim()
+            : 'مۆبایل نییە';
+    final String addressText =
+        (supplier.address != null && supplier.address!.trim().isNotEmpty)
+            ? supplier.address!.trim()
+            : 'ناونیشان نییە';
+
+    final bool isMobileOrTabletView = isMobileOrTablet ||
+        (MediaQuery.of(context).size.width < AppBreakpoints.desktopMin);
+
+    return AppCard(
+      onTap: () => _showEditSupplierDialog(context, supplier),
+      onLongPress: () => _deleteSupplier(supplier),
+      padding: const EdgeInsets.symmetric(
+        horizontal: 12.0,
+        vertical: 8.0,
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(
+              color: theme.colorScheme.primary.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Icon(
+              Icons.storefront,
+              color: theme.colorScheme.primary,
+              size: 26,
+            ),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        supplier.name,
+                        style: AppTextStyles.bodyBold.copyWith(fontSize: 14),
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                      ),
+                    ),
+                    if (canReconcile)
+                      IconButton(
+                        icon: const Icon(
+                          Icons.account_balance_wallet_outlined,
+                          size: 18,
+                        ),
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        onPressed: () {
+                          showDialog(
+                            context: context,
+                            builder: (context) =>
+                                SupplierReconciliationDialog(
+                                    supplier: supplier),
+                          );
+                        },
+                        tooltip: 'لێکترازانی دارایی',
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  'کەسی پەیوەندی: ${supplier.contactPerson != null && supplier.contactPerson!.isNotEmpty ? supplier.contactPerson : '-'}',
+                  style: AppTextStyles.caption.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontSize: 11,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 2),
+                if (isMobileOrTabletView) ...[
+                  Text(
+                    phoneText,
+                    style: AppTextStyles.caption.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant.withValues(
+                        alpha: 0.8,
+                      ),
+                      fontSize: 11,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    addressText,
+                    style: AppTextStyles.caption.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant.withValues(
+                        alpha: 0.8,
+                      ),
+                      fontSize: 11,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ] else ...[
+                  Text(
+                    '$phoneText • $addressText',
+                    style: AppTextStyles.caption.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant.withValues(
+                        alpha: 0.8,
+                      ),
+                      fontSize: 11,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                'کۆد: #${supplier.id}',
+                style: AppTextStyles.caption.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant.withValues(
+                    alpha: 0.7,
+                  ),
+                  fontSize: 11,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 7,
+                  vertical: 3,
+                ),
+                decoration: BoxDecoration(
+                  color: hasDebt
+                      ? AppColors.danger.withValues(alpha: 0.1)
+                      : AppColors.success.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _formatCurrency(supplier.debt),
+                      style: AppTextStyles.bodyBold.copyWith(
+                        color: hasDebt ? AppColors.danger : AppColors.success,
+                        fontSize: 11,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 5,
+                        vertical: 1.5,
+                      ),
+                      decoration: BoxDecoration(
+                        color: hasDebt ? AppColors.danger : AppColors.success,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Text(
+                        hasDebt ? 'قەرزدار' : 'پاکە',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 9,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'Rudaw',
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class ReceivePODialog extends StatefulWidget {
+  final PurchaseOrderModel order;
+  final PurchaseActions actions;
+
+  const ReceivePODialog({
+    super.key,
+    required this.order,
+    required this.actions,
+  });
+
+  @override
+  State<ReceivePODialog> createState() => _ReceivePODialogState();
+}
+
+class _ReceivePODialogState extends State<ReceivePODialog> {
+  final Map<int, TextEditingController> _controllers = {};
+  final _formKey = GlobalKey<FormState>();
+  bool _isSubmitting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    for (var item in widget.order.items) {
+      final remaining = item.quantity - item.receivedQuantity;
+      _controllers[item.id] = TextEditingController(text: remaining.toString());
+    }
+  }
+
+  @override
+  void dispose() {
+    for (var controller in _controllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Expanded(
+            child: Text(
+              'وەرگرتنی پسوڵەی کڕین #${widget.order.orderNumber}',
+              style: AppTextStyles.bodyBold,
+              textAlign: TextAlign.right,
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.close),
+            onPressed: _isSubmitting ? null : () => Navigator.pop(context),
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(),
+          ),
+        ],
+      ),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Form(
+          key: _formKey,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'دەتوانیت بڕی وەرگیراو بۆ هەر کاڵایەک دەستکاری بکەیت بۆ وەرگرتنی بەشەکی، یان سەرجەمیان وەک خۆی وەرگریت.',
+                  style: AppTextStyles.caption,
+                  textDirection: TextDirection.rtl,
+                ),
+                const SizedBox(height: AppSpacing.md),
+                ...widget.order.items.map((item) {
+                  final remaining = item.quantity - item.receivedQuantity;
+                  final controller = _controllers[item.id];
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: AppSpacing.md),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          item.productName,
+                          style: AppTextStyles.bodyBold,
+                          textDirection: TextDirection.rtl,
+                        ),
+                        const SizedBox(height: 4),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              'سەرجەم: ${item.quantity} • وەرگیراو: ${item.receivedQuantity}',
+                              style: AppTextStyles.caption,
+                            ),
+                            Text(
+                              'مابووەوە: $remaining',
+                              style: AppTextStyles.caption.copyWith(
+                                color: remaining > 0 ? AppColors.warning : AppColors.success,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        AppTextField(
+                          controller: controller,
+                          keyboardType: TextInputType.number,
+                          labelText: 'بڕی وەرگیراوی ئەمجارە',
+                          validator: (value) {
+                            if (value == null || value.trim().isEmpty) {
+                              return 'پێویستە بڕێک بنووسیت';
+                            }
+                            final qty = int.tryParse(value);
+                            if (qty == null) {
+                              return 'پێویستە ژمارەی تەواو بێت';
+                            }
+                            if (qty < 0) {
+                              return 'ناتوانرێت بڕی کەمتر لە ٠ بێت';
+                            }
+                            if (qty > remaining) {
+                              return 'ناتوانرێت لە بڕی مابووەوە ($remaining) زیاتر بێت';
+                            }
+                            return null;
+                          },
+                        ),
+                        const Divider(height: AppSpacing.lg),
+                      ],
+                    ),
+                  );
+                }),
+              ],
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        ElevatedButton(
+          onPressed: _isSubmitting ? null : _submitFullReceive,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: AppColors.success.withValues(alpha: 0.1),
+            foregroundColor: AppColors.success,
+          ),
+          child: const Text('وەرگرتنی تەواو'),
+        ),
+        ElevatedButton(
+          onPressed: _isSubmitting ? null : _submitPartialReceive,
+          child: const Text('وەرگرتنی دیاریکراو'),
+        ),
+      ],
+    );
+  }
+
+  void _submitFullReceive() async {
+    setState(() {
+      _isSubmitting = true;
+    });
+    try {
+      await widget.actions.receivePurchaseOrder(widget.order.id);
+      if (mounted) {
+        Navigator.pop(context, true);
+      }
+    } catch (e) {
+      if (mounted) {
+        AppSnackbar.show(
+          context,
+          message: e.toString().replaceAll('Exception: ', ''),
+          type: SnackbarType.error,
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSubmitting = false;
+        });
+      }
+    }
+  }
+
+  void _submitPartialReceive() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() {
+      _isSubmitting = true;
+    });
+
+    try {
+      final List<Map<String, dynamic>> itemsPayload = [];
+      for (var item in widget.order.items) {
+        final controller = _controllers[item.id];
+        final qty = int.parse(controller!.text);
+        if (qty > 0) {
+          itemsPayload.add({
+            'item_id': item.id,
+            'product_id': item.productId,
+            'quantity': qty,
+          });
+        }
+      }
+
+      if (itemsPayload.isEmpty) {
+        throw Exception('هیچ کاڵایەک هەڵنەبژێردراوە بۆ وەرگرتن (بڕی هەموویان ٠ یە).');
+      }
+
+      await widget.actions.receivePurchaseOrder(widget.order.id, items: itemsPayload);
+      if (mounted) {
+        Navigator.pop(context, true);
+      }
+    } catch (e) {
+      if (mounted) {
+        AppSnackbar.show(
+          context,
+          message: e.toString().replaceAll('Exception: ', ''),
+          type: SnackbarType.error,
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSubmitting = false;
+        });
+      }
+    }
+  }
+}

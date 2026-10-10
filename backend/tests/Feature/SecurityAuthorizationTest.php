@@ -1,0 +1,742 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Models\User;
+use App\Models\Role;
+use App\Models\Customer;
+use App\Models\SalesOrder;
+use App\Models\DeliveryTrip;
+use App\Models\DeliveryTripOrder;
+use App\Models\Route as RouteModel;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Tests\TestCase;
+
+class SecurityAuthorizationTest extends TestCase
+{
+    use RefreshDatabase;
+
+    /**
+     * Test that an inactive user cannot access any protected routes.
+     */
+    public function test_inactive_user_is_blocked_and_token_revoked(): void
+    {
+        $role = Role::create([
+            'name' => 'salesman',
+            'display_name' => 'Salesman',
+            'permissions' => ['orders.create']
+        ]);
+
+        $user = User::create([
+            'name' => 'Inactive Salesman',
+            'phone' => '07700000000',
+            'password' => bcrypt('password'),
+            'role_id' => $role->id,
+            'is_active' => false
+        ]);
+
+        $response = $this->actingAs($user)->getJson('/api/v1/auth/me');
+
+        $response->assertStatus(403);
+        $response->assertJsonStructure(['message', 'error']);
+    }
+
+    /**
+     * Test that a salesman cannot access customers that do not belong to their assigned routes.
+     */
+    public function test_salesman_cannot_view_unassigned_customer(): void
+    {
+        $role = Role::create([
+            'name' => 'salesman',
+            'display_name' => 'Salesman',
+            'permissions' => ['customers.view']
+        ]);
+
+        $salesman = User::create([
+            'name' => 'Salesman',
+            'phone' => '07700000001',
+            'password' => bcrypt('password'),
+            'role_id' => $role->id,
+            'is_active' => true
+        ]);
+
+        $route1 = RouteModel::create(['name' => 'Route 1']);
+        $route2 = RouteModel::create(['name' => 'Route 2']);
+
+        // Assign route1 to salesman
+        $salesman->routeSalesmen()->create([
+            'route_id' => $route1->id,
+            'is_active' => true
+        ]);
+
+        $assignedCustomer = Customer::create([
+            'name' => 'Assigned Cust',
+            'phone' => '07701111111',
+            'route_id' => $route1->id,
+            'current_balance' => 0
+        ]);
+
+        $unassignedCustomer = Customer::create([
+            'name' => 'Unassigned Cust',
+            'phone' => '07702222222',
+            'route_id' => $route2->id,
+            'current_balance' => 0
+        ]);
+
+        // Allowed Customer Access
+        $this->actingAs($salesman)
+            ->getJson("/api/v1/customers/{$assignedCustomer->id}")
+            ->assertStatus(200);
+
+        $this->actingAs($salesman)
+            ->getJson("/api/v1/customers/{$assignedCustomer->id}/ledger")
+            ->assertStatus(200);
+
+        // Blocked Customer Access (IDOR Prevention)
+        $this->actingAs($salesman)
+            ->getJson("/api/v1/customers/{$unassignedCustomer->id}")
+            ->assertStatus(403);
+
+        $this->actingAs($salesman)
+            ->getJson("/api/v1/customers/{$unassignedCustomer->id}/ledger")
+            ->assertStatus(403);
+    }
+
+    /**
+     * Test that a salesman cannot view or edit sales orders owned by other salesmen.
+     */
+    public function test_salesman_cannot_access_other_salesmans_order(): void
+    {
+        $role = Role::create([
+            'name' => 'salesman',
+            'display_name' => 'Salesman',
+            'permissions' => ['orders.create', 'customers.view']
+        ]);
+
+        $salesman1 = User::create([
+            'name' => 'Salesman 1',
+            'phone' => '07700000002',
+            'password' => bcrypt('password'),
+            'role_id' => $role->id,
+            'is_active' => true
+        ]);
+
+        $salesman2 = User::create([
+            'name' => 'Salesman 2',
+            'phone' => '07700000003',
+            'password' => bcrypt('password'),
+            'role_id' => $role->id,
+            'is_active' => true
+        ]);
+
+        $route = RouteModel::create(['name' => 'Route']);
+        $customer = Customer::create([
+            'name' => 'Cust',
+            'phone' => '07703333333',
+            'route_id' => $route->id,
+            'current_balance' => 0
+        ]);
+
+        $orderOfSalesman1 = SalesOrder::create([
+            'order_number' => 'ORD-1',
+            'customer_id' => $customer->id,
+            'salesman_id' => $salesman1->id,
+            'status' => 'DRAFT',
+            'total_amount' => 100,
+            'discount_amount' => 0,
+            'final_amount' => 100,
+            'is_active' => true
+        ]);
+
+        // Salesman 1 should be allowed
+        $this->actingAs($salesman1)
+            ->getJson("/api/v1/orders/{$orderOfSalesman1->id}")
+            ->assertStatus(200);
+
+        // Salesman 2 should be Forbidden (IDOR Blocked)
+        $this->actingAs($salesman2)
+            ->getJson("/api/v1/orders/{$orderOfSalesman1->id}")
+            ->assertStatus(403);
+    }
+
+    /**
+     * Test that a driver cannot perform delivery updates on a trip assigned to another driver.
+     */
+    public function test_driver_cannot_deliver_unassigned_trip_order(): void
+    {
+        $role = Role::create([
+            'name' => 'driver',
+            'display_name' => 'Driver',
+            'permissions' => ['delivery.update']
+        ]);
+
+        $salesmanRole = Role::create([
+            'name' => 'salesman',
+            'display_name' => 'Salesman',
+            'permissions' => ['orders.create']
+        ]);
+
+        $driver1 = User::create([
+            'name' => 'Driver 1',
+            'phone' => '07700000004',
+            'password' => bcrypt('password'),
+            'role_id' => $role->id,
+            'is_active' => true
+        ]);
+
+        $driver2 = User::create([
+            'name' => 'Driver 2',
+            'phone' => '07700000005',
+            'password' => bcrypt('password'),
+            'role_id' => $role->id,
+            'is_active' => true
+        ]);
+
+        $salesman = User::create([
+            'name' => 'Salesman User',
+            'phone' => '07700000099',
+            'password' => bcrypt('password'),
+            'role_id' => $salesmanRole->id,
+            'is_active' => true
+        ]);
+
+        $route = RouteModel::create(['name' => 'Route']);
+
+        $customer = Customer::create([
+            'name' => 'Customer User',
+            'phone' => '07704444499',
+            'route_id' => $route->id,
+            'current_balance' => 0
+        ]);
+
+        $warehouse = \App\Models\Warehouse::create([
+            'name' => 'Test WH',
+            'is_main' => true,
+            'is_active' => true
+        ]);
+
+        $trip = DeliveryTrip::create([
+            'trip_number' => 'TRP-1',
+            'driver_id' => $driver1->id,
+            'trip_date' => now()->toDateString(),
+            'status' => 'IN_PROGRESS',
+            'total_orders' => 1,
+            'created_by' => $salesman->id
+        ]);
+
+        $order = SalesOrder::create([
+            'order_number' => 'ORD-2',
+            'customer_id' => $customer->id,
+            'salesman_id' => $salesman->id,
+            'warehouse_id' => $warehouse->id,
+            'status' => 'IN_DELIVERY',
+            'total_amount' => 100,
+            'discount_amount' => 0,
+            'final_amount' => 100,
+            'is_active' => true
+        ]);
+
+        $tripOrder = DeliveryTripOrder::create([
+            'delivery_trip_id' => $trip->id,
+            'sales_order_id' => $order->id,
+            'status' => 'PENDING',
+            'delivery_order' => 1
+        ]);
+
+        // Driver 2 tries to deliver (should be Forbidden)
+        $this->actingAs($driver2)
+            ->postJson("/api/v1/delivery-trips/orders/{$tripOrder->id}/deliver", [
+                'received_amount' => 100,
+                'notes' => 'No notes'
+            ])
+            ->assertStatus(403);
+    }
+
+    /**
+     * Test that an Admin cannot deactivate or delete an Owner.
+     */
+    public function test_admin_cannot_delete_or_deactivate_owner(): void
+    {
+        $roleOwner = Role::create([
+            'name' => Role::OWNER,
+            'display_name' => 'Owner',
+            'permissions' => ['*']
+        ]);
+
+        $roleAdmin = Role::create([
+            'name' => Role::ADMIN,
+            'display_name' => 'Admin',
+            'permissions' => ['users.manage']
+        ]);
+
+        $owner = User::create([
+            'name' => 'The Owner',
+            'phone' => '07700000006',
+            'password' => bcrypt('password'),
+            'role_id' => $roleOwner->id,
+            'is_active' => true
+        ]);
+
+        $admin = User::create([
+            'name' => 'An Admin',
+            'phone' => '07700000007',
+            'password' => bcrypt('password'),
+            'role_id' => $roleAdmin->id,
+            'is_active' => true
+        ]);
+
+        // Admin tries to delete Owner (should be Forbidden)
+        $this->actingAs($admin)
+            ->deleteJson("/api/v1/users/{$owner->id}")
+            ->assertStatus(403);
+
+        // Admin tries to deactivate Owner (should be Forbidden)
+        $this->actingAs($admin)
+            ->putJson("/api/v1/users/{$owner->id}", [
+                'name' => 'The Owner New Name',
+                'phone' => '07700000006',
+                'role_id' => $roleOwner->id,
+                'is_active' => false
+            ])
+            ->assertStatus(403);
+    }
+
+    /**
+     * Test that warehouse staff and drivers cannot view suppliers list (403 Forbidden).
+     */
+    public function test_warehouse_and_driver_cannot_view_suppliers(): void
+    {
+        $warehouseRole = Role::create([
+            'name' => 'warehouse',
+            'display_name' => 'Warehouse',
+            'permissions' => ['stock.view', 'stock.pack']
+        ]);
+
+        $driverRole = Role::create([
+            'name' => 'driver',
+            'display_name' => 'Driver',
+            'permissions' => ['delivery.view', 'delivery.update']
+        ]);
+
+        $warehouseUser = User::create([
+            'name' => 'Warehouse Staff',
+            'phone' => '07700000008',
+            'password' => bcrypt('password'),
+            'role_id' => $warehouseRole->id,
+            'is_active' => true
+        ]);
+
+        $driverUser = User::create([
+            'name' => 'Driver Staff',
+            'phone' => '07700000009',
+            'password' => bcrypt('password'),
+            'role_id' => $driverRole->id,
+            'is_active' => true
+        ]);
+
+        $this->actingAs($warehouseUser)
+            ->getJson('/api/v1/suppliers')
+            ->assertStatus(403);
+
+        $this->actingAs($driverUser)
+            ->getJson('/api/v1/suppliers')
+            ->assertStatus(403);
+    }
+
+    /**
+     * Test that a salesman cannot collect payments for an unassigned customer (IDOR prevention).
+     */
+    public function test_salesman_cannot_collect_payment_for_unassigned_customer(): void
+    {
+        $role = Role::create([
+            'name' => 'salesman',
+            'display_name' => 'Salesman',
+            'permissions' => ['orders.create', 'customers.view']
+        ]);
+
+        $salesman = User::create([
+            'name' => 'Salesman Collect',
+            'phone' => '07700000010',
+            'password' => bcrypt('password'),
+            'role_id' => $role->id,
+            'is_active' => true
+        ]);
+
+        $route1 = RouteModel::create(['name' => 'Route 1']);
+        $route2 = RouteModel::create(['name' => 'Route 2']);
+
+        $salesman->routeSalesmen()->create([
+            'route_id' => $route1->id,
+            'is_active' => true
+        ]);
+
+        $unassignedCustomer = Customer::create([
+            'name' => 'Unassigned Cust',
+            'phone' => '07702222223',
+            'route_id' => $route2->id,
+            'current_balance' => 50000
+        ]);
+
+        $this->actingAs($salesman)
+            ->postJson('/api/v1/payments', [
+                'customer_id' => $unassignedCustomer->id,
+                'amount' => 10000,
+                'payment_method' => 'CASH'
+            ])
+            ->assertStatus(403);
+    }
+
+    /**
+     * Test that a salesman cannot view route customer lists for unassigned routes.
+     */
+    public function test_salesman_cannot_view_customers_of_unassigned_route(): void
+    {
+        $role = Role::create([
+            'name' => 'salesman',
+            'display_name' => 'Salesman',
+            'permissions' => ['customers.view']
+        ]);
+
+        $salesman = User::create([
+            'name' => 'Salesman Route',
+            'phone' => '07700000011',
+            'password' => bcrypt('password'),
+            'role_id' => $role->id,
+            'is_active' => true
+        ]);
+
+        $route1 = RouteModel::create(['name' => 'Route 1']);
+        $route2 = RouteModel::create(['name' => 'Route 2']);
+
+        $salesman->routeSalesmen()->create([
+            'route_id' => $route1->id,
+            'is_active' => true
+        ]);
+
+        // Allowed for assigned route
+        $this->actingAs($salesman)
+            ->getJson("/api/v1/routes/{$route1->id}/customers")
+            ->assertStatus(200);
+
+        // Forbidden for unassigned route
+        $this->actingAs($salesman)
+            ->getJson("/api/v1/routes/{$route2->id}/customers")
+            ->assertStatus(403);
+    }
+
+    /**
+     * Test sales order update authorization for assigned salesman, unassigned customer, admin/owner, and warehouse/driver roles.
+     */
+    public function test_sales_order_update_authorization_rules(): void
+    {
+        $salesmanRole = Role::create([
+            'name' => 'salesman',
+            'display_name' => 'Salesman',
+            'permissions' => ['orders.create', 'customers.view']
+        ]);
+        $warehouseRole = Role::create([
+            'name' => 'warehouse',
+            'display_name' => 'Warehouse',
+            'permissions' => ['stock.view', 'stock.pack']
+        ]);
+        $driverRole = Role::create([
+            'name' => 'driver',
+            'display_name' => 'Driver',
+            'permissions' => ['delivery.view', 'delivery.update']
+        ]);
+        $adminRole = Role::create([
+            'name' => Role::ADMIN,
+            'display_name' => 'Admin',
+            'permissions' => ['*']
+        ]);
+        $ownerRole = Role::create([
+            'name' => Role::OWNER,
+            'display_name' => 'Owner',
+            'permissions' => ['*']
+        ]);
+
+        $route1 = RouteModel::create(['name' => 'Route 1']);
+        $route2 = RouteModel::create(['name' => 'Route 2']);
+
+        $salesman1 = User::create([
+            'name' => 'Salesman 1',
+            'phone' => '07700000050',
+            'password' => bcrypt('password'),
+            'role_id' => $salesmanRole->id,
+            'is_active' => true
+        ]);
+        $salesman1->routeSalesmen()->create([
+            'route_id' => $route1->id,
+            'is_active' => true
+        ]);
+
+        $salesman2 = User::create([
+            'name' => 'Salesman 2',
+            'phone' => '07700000051',
+            'password' => bcrypt('password'),
+            'role_id' => $salesmanRole->id,
+            'is_active' => true
+        ]);
+        $salesman2->routeSalesmen()->create([
+            'route_id' => $route2->id,
+            'is_active' => true
+        ]);
+
+        $admin = User::create([
+            'name' => 'Admin User',
+            'phone' => '07700000052',
+            'password' => bcrypt('password'),
+            'role_id' => $adminRole->id,
+            'is_active' => true
+        ]);
+
+        $owner = User::create([
+            'name' => 'Owner User',
+            'phone' => '07700000053',
+            'password' => bcrypt('password'),
+            'role_id' => $ownerRole->id,
+            'is_active' => true
+        ]);
+
+        $warehouseUser = User::create([
+            'name' => 'Warehouse User',
+            'phone' => '07700000054',
+            'password' => bcrypt('password'),
+            'role_id' => $warehouseRole->id,
+            'is_active' => true
+        ]);
+
+        $driverUser = User::create([
+            'name' => 'Driver User',
+            'phone' => '07700000055',
+            'password' => bcrypt('password'),
+            'role_id' => $driverRole->id,
+            'is_active' => true
+        ]);
+
+        $customer1 = Customer::create([
+            'name' => 'Cust 1',
+            'phone' => '07704444441',
+            'route_id' => $route1->id,
+            'current_balance' => 0
+        ]);
+
+        $customer2 = Customer::create([
+            'name' => 'Cust 2',
+            'phone' => '07704444442',
+            'route_id' => $route2->id,
+            'current_balance' => 0
+        ]);
+
+        $warehouse = \App\Models\Warehouse::create([
+            'name' => 'Main WH',
+            'is_main' => true,
+            'is_active' => true
+        ]);
+
+        $product = \App\Models\Product::create([
+            'name' => 'Prod 1',
+            'sku' => 'SKU-001',
+            'cost_price' => 1000,
+            'price_n1' => 2000,
+            'price_n2' => 2000,
+            'price_n3' => 2000,
+            'is_active' => true
+        ]);
+
+        $orderOfSalesman1 = SalesOrder::create([
+            'order_number' => 'ORD-SEC-1',
+            'customer_id' => $customer1->id,
+            'salesman_id' => $salesman1->id,
+            'warehouse_id' => $warehouse->id,
+            'order_date' => now()->toDateString(),
+            'status' => 'DRAFT',
+            'subtotal' => 2000,
+            'total_amount' => 2000,
+            'total_profit' => 1000,
+            'created_by' => $salesman1->id
+        ]);
+        $orderOfSalesman1->items()->create([
+            'product_id' => $product->id,
+            'quantity' => 1,
+            'unit_price' => 2000,
+            'cost_price' => 1000,
+            'price_type' => 'N1',
+            'line_total' => 2000,
+            'total_price' => 2000,
+            'profit' => 1000
+        ]);
+
+        $updatePayloadAuthorized = [
+            'customer_id' => $customer1->id,
+            'warehouse_id' => $warehouse->id,
+            'notes' => 'Updated notes by salesman 1',
+            'items' => [
+                ['product_id' => $product->id, 'quantity' => 2]
+            ]
+        ];
+
+        // 1. Authorized salesman update own order for assigned customer -> 200
+        $this->actingAs($salesman1)
+            ->putJson("/api/v1/orders/{$orderOfSalesman1->id}", $updatePayloadAuthorized)
+            ->assertStatus(200);
+
+        // 2. Unauthorized salesman update another salesman's order -> 403
+        $this->actingAs($salesman2)
+            ->putJson("/api/v1/orders/{$orderOfSalesman1->id}", $updatePayloadAuthorized)
+            ->assertStatus(403);
+
+        // 3. Salesman updating order to an unassigned customer -> 403
+        $updatePayloadUnassignedCustomer = [
+            'customer_id' => $customer2->id,
+            'warehouse_id' => $warehouse->id,
+            'notes' => 'Attempting to assign unassigned customer',
+            'items' => [
+                ['product_id' => $product->id, 'quantity' => 1]
+            ]
+        ];
+        $this->actingAs($salesman1)
+            ->putJson("/api/v1/orders/{$orderOfSalesman1->id}", $updatePayloadUnassignedCustomer)
+            ->assertStatus(403);
+
+        // 4. Warehouse and Driver staff updating sales order -> 403 Forbidden (Missing orders.create)
+        $this->actingAs($warehouseUser)
+            ->putJson("/api/v1/orders/{$orderOfSalesman1->id}", $updatePayloadAuthorized)
+            ->assertStatus(403);
+
+        $this->actingAs($driverUser)
+            ->putJson("/api/v1/orders/{$orderOfSalesman1->id}", $updatePayloadAuthorized)
+            ->assertStatus(403);
+
+        // 5. Admin and Owner updating sales order -> 200 OK
+        $this->actingAs($admin)
+            ->putJson("/api/v1/orders/{$orderOfSalesman1->id}", $updatePayloadAuthorized)
+            ->assertStatus(200);
+
+        $this->actingAs($owner)
+            ->putJson("/api/v1/orders/{$orderOfSalesman1->id}", $updatePayloadAuthorized)
+            ->assertStatus(200);
+    }
+
+    /**
+     * Test that route salesman assignment rejects non-salesmen or inactive users.
+     */
+    public function test_route_assignment_rejects_non_salesmen_or_inactive_users(): void
+    {
+        $adminRole = Role::create([
+            'name' => Role::ADMIN,
+            'display_name' => 'Admin',
+            'permissions' => ['*']
+        ]);
+        $admin = User::create([
+            'name' => 'Admin User',
+            'phone' => '07709999999',
+            'password' => bcrypt('password'),
+            'role_id' => $adminRole->id,
+            'is_active' => true
+        ]);
+
+        $driverRole = Role::create([
+            'name' => Role::DRIVER,
+            'display_name' => 'Driver',
+            'permissions' => []
+        ]);
+        $driverUser = User::create([
+            'name' => 'Driver User',
+            'phone' => '07708888888',
+            'password' => bcrypt('password'),
+            'role_id' => $driverRole->id,
+            'is_active' => true
+        ]);
+
+        $salesmanRole = Role::create([
+            'name' => Role::SALESMAN,
+            'display_name' => 'Salesman',
+            'permissions' => []
+        ]);
+        $inactiveSalesman = User::create([
+            'name' => 'Inactive Salesman',
+            'phone' => '07707777777',
+            'password' => bcrypt('password'),
+            'role_id' => $salesmanRole->id,
+            'is_active' => false
+        ]);
+
+        $route = RouteModel::create(['name' => 'Route X']);
+
+        // 1. Assign driver (non-salesman) -> 422
+        $this->actingAs($admin)
+            ->postJson("/api/v1/routes/{$route->id}/assign-salesman", [
+                'salesman_id' => $driverUser->id,
+            ])
+            ->assertStatus(422);
+
+        // 2. Assign inactive salesman -> 422
+        $this->actingAs($admin)
+            ->postJson("/api/v1/routes/{$route->id}/assign-salesman", [
+                'salesman_id' => $inactiveSalesman->id,
+            ])
+            ->assertStatus(422);
+    }
+
+    /**
+     * Test that warehouse staff can successfully view orders to pack and stock list.
+     */
+    public function test_warehouse_user_can_access_orders_to_pack_and_stock(): void
+    {
+        $warehouseRole = Role::create([
+            'name' => 'warehouse',
+            'display_name' => 'Warehouse Staff',
+            'permissions' => ['stock.view', 'stock.pack']
+        ]);
+
+        $warehouse = \App\Models\Warehouse::create([
+            'name' => 'Erbil Warehouse',
+            'is_main' => true,
+            'is_active' => true,
+        ]);
+
+        $warehouseUser = User::create([
+            'name' => 'Packer User',
+            'phone' => '07705555555',
+            'password' => bcrypt('password'),
+            'role_id' => $warehouseRole->id,
+            'warehouse_id' => $warehouse->id,
+            'is_active' => true,
+        ]);
+
+        $this->actingAs($warehouseUser)
+            ->getJson('/api/v1/warehouse/orders-to-pack')
+            ->assertStatus(200)
+            ->assertJsonStructure(['message', 'data']);
+
+        $this->actingAs($warehouseUser)
+            ->getJson('/api/v1/warehouse/stock')
+            ->assertStatus(200)
+            ->assertJsonStructure(['message', 'data']);
+    }
+
+    /**
+     * Test that warehouse user permissions resolve correctly even if stored as JSON string or empty.
+     */
+    public function test_warehouse_fallback_permissions_resolve_without_explicit_role_array(): void
+    {
+        $warehouseRole = Role::create([
+            'name' => 'warehouse',
+            'display_name' => 'Warehouse Staff',
+            'permissions' => []
+        ]);
+
+        $user = User::create([
+            'name' => 'Warehouse Staff 2',
+            'phone' => '07706666666',
+            'password' => bcrypt('password'),
+            'role_id' => $warehouseRole->id,
+            'is_active' => true,
+        ]);
+
+        $this->assertTrue($user->hasPermission('stock.view'));
+        $this->assertTrue($user->hasPermission('stock.pack'));
+        $this->assertFalse($user->hasPermission('users.manage'));
+    }
+}

@@ -1,0 +1,188 @@
+class UserRoutePlan {
+  final int id;
+  final int routeId;
+  final String routeName;
+  final String? dayOfWeek;
+  final int weekNumber;
+
+  UserRoutePlan({
+    required this.id,
+    required this.routeId,
+    required this.routeName,
+    this.dayOfWeek,
+    required this.weekNumber,
+  });
+
+  factory UserRoutePlan.fromJson(Map<String, dynamic> json) {
+    final routeMap = json['route'] as Map<String, dynamic>?;
+    return UserRoutePlan(
+      id: json['id'] ?? 0,
+      routeId: json['route_id'] ?? 0,
+      routeName: routeMap?['name']?.toString() ?? 'گشتی',
+      dayOfWeek: json['day_of_week']?.toString(),
+      weekNumber: json['week_number'] ?? 1,
+    );
+  }
+}
+
+class UserModel {
+  final int id;
+  final String name;
+  final String phone;
+  final String role; // owner, admin, salesman, warehouse, driver
+  final int? roleId;
+  final double? commissionRate;
+  final int? fixedSalary;
+  final String? barcode;
+  final bool? isActive;
+  final int? warehouseId;
+  final List<String>? permissions;
+  final String? imageUrl;
+  final String? routingCycle;
+  final List<UserRoutePlan> routePlans;
+
+  UserModel({
+    required this.id,
+    required this.name,
+    required this.phone,
+    required this.role,
+    this.roleId,
+    this.commissionRate,
+    this.fixedSalary,
+    this.barcode,
+    this.isActive,
+    this.warehouseId,
+    this.permissions,
+    this.imageUrl,
+    this.routingCycle,
+    this.routePlans = const [],
+  });
+
+  factory UserModel.fromJson(Map<String, dynamic> json) {
+    String roleName = 'salesman';
+    int? roleIdVal;
+    List<String>? parsedPermissions;
+
+    if (json['role'] is Map) {
+      roleName = json['role']['name'] ?? 'salesman';
+      roleIdVal = json['role']['id'];
+      if (json['role']['permissions'] is List) {
+        parsedPermissions = (json['role']['permissions'] as List)
+            .map((e) => e.toString())
+            .toList();
+      }
+    } else if (json['role'] is String) {
+      roleName = json['role'];
+    }
+
+    if (parsedPermissions == null && json['permissions'] is List) {
+      parsedPermissions = (json['permissions'] as List)
+          .map((e) => e.toString())
+          .toList();
+    }
+
+    double? commRate;
+    if (json['commission_rate'] != null) {
+      commRate = double.tryParse(json['commission_rate'].toString());
+    }
+
+    int? fixedSal;
+    if (json['fixed_salary'] != null) {
+      fixedSal = int.tryParse(json['fixed_salary'].toString());
+    }
+
+    final rawPlans = json['route_salesmen'] as List? ?? [];
+    final parsedPlans = rawPlans
+        .map((item) => UserRoutePlan.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
+
+    return UserModel(
+      id: json['id'] ?? 0,
+      name: json['name'] ?? '',
+      phone: json['phone'] ?? '',
+      role: roleName,
+      roleId: json['role_id'] ?? roleIdVal,
+      commissionRate: commRate,
+      fixedSalary: fixedSal,
+      barcode: json['barcode'],
+      isActive: json['is_active'] is bool
+          ? json['is_active']
+          : (json['is_active'] == 1),
+      warehouseId: json['warehouse_id'],
+      permissions: parsedPermissions,
+      imageUrl: json['image_url'],
+      routingCycle: json['routing_cycle']?.toString(),
+      routePlans: parsedPlans,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'name': name,
+      'phone': phone,
+      'role': role,
+      'role_id': roleId,
+      'commission_rate': commissionRate,
+      'fixed_salary': fixedSalary,
+      'barcode': barcode,
+      'is_active': isActive,
+      'warehouse_id': warehouseId,
+      'permissions': permissions,
+      'image_url': imageUrl,
+      'routing_cycle': routingCycle,
+    };
+  }
+
+  bool get isAdmin {
+    final lowerRole = role.toLowerCase();
+    return lowerRole == 'admin' || lowerRole == 'owner';
+  }
+
+  bool get isDriver => role.toLowerCase() == 'driver';
+  bool get isSalesman => role.toLowerCase() == 'salesman';
+  bool get isWarehouse => role.toLowerCase() == 'warehouse';
+
+  bool hasPermission(String permission) {
+    final lowerRole = role.toLowerCase();
+
+    // Admin and Owner have all permissions
+    if (lowerRole == 'admin' || lowerRole == 'owner') {
+      return true;
+    }
+
+    // If server sent dynamic permissions, check them
+    if (permissions != null && permissions!.isNotEmpty) {
+      return permissions!.contains(permission) || permissions!.contains('*');
+    }
+
+    // Role-specific static permissions mapping (aligns 100% with backend RoleSeeder)
+    final Map<String, List<String>> rolePermissions = {
+      'salesman': [
+        'orders.create',
+        'orders.view',
+        'customers.view',
+        'customers.create',
+        'products.view',
+        'commissions.view',
+        'suppliers.view',
+      ],
+      'warehouse': [
+        'stock.view',
+        'stock.pack',
+        'stock.reconcile',
+        'stock.transfer',
+        'stock.adjust',
+        'purchases.receive',
+      ],
+      'driver': [
+        'delivery.view',
+        'delivery.update',
+        'delivery.confirm',
+      ],
+    };
+
+    final rolePerms = rolePermissions[lowerRole] ?? [];
+    return rolePerms.contains(permission);
+  }
+}

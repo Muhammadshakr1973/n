@@ -1,0 +1,159 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Customer;
+use Illuminate\Contracts\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\DB;
+
+class CustomerService
+{
+    /**
+     * هێنانی کڕیارەکان بەپێی فلتەر و مافی بەکارهێنەر
+     */
+    public function getAllCustomers(array $filters, $user): LengthAwarePaginator
+    {
+        $query = Customer::with('route');
+
+        // ئەگەر بەکارهێنەر مەندوب بوو، تەنها کڕیارەکانی ئەو گەڕەکانە دەبینێت کە بۆی دانراون یان بەڕاستەوخۆ بۆی تەرخانکراون
+        if ($user->isSalesman()) {
+            $routeIds = $user->getAssignedRouteIds();
+            $directCustomerIds = \DB::table('customer_assignments')
+                ->where('salesman_id', $user->id)
+                ->where('assigned_from', '<=', now()->toDateString())
+                ->where(function ($q) {
+                    $q->whereNull('assigned_until')
+                      ->orWhere('assigned_until', '>=', now()->toDateString());
+                })
+                ->pluck('customer_id')
+                ->toArray();
+
+            $query->where(function ($q) use ($routeIds, $directCustomerIds) {
+                $q->whereIn('route_id', $routeIds)
+                  ->orWhereIn('id', $directCustomerIds)
+                  ->orWhere('id', 0);
+            });
+        }
+
+        // فلتەرکردن بەپێی گەڕەک ئەگەر نێردرابوو
+        if (!empty($filters['route_id'])) {
+            $query->where(function ($q) use ($filters) {
+                $q->where('route_id', $filters['route_id'])
+                  ->orWhere('id', 0);
+            });
+        }
+
+        // گەڕان بەپێی ناو یان تەلەفۆن
+        if (!empty($filters['search'])) {
+            $search = $filters['search'];
+            $query->where(function ($q) use ($search) {
+                $q->where('name', 'like', "%{$search}%")
+                    ->orWhere('phone', 'like', "%{$search}%")
+                    ->orWhere('id', 0);
+            });
+        }
+
+        // فلتەرکردن بەپێی قەرز (تەنها ئەوانەی قەرزدارن)
+        if (isset($filters['has_debt']) && $filters['has_debt'] == 'true') {
+            $query->where('current_balance', '>', 0);
+        }
+
+        // کڕیاری کاتی هەمیشە لە سەرەتای لیستەکە بێت
+        $query->orderByRaw("CASE WHEN id = 0 THEN 0 ELSE 1 END");
+
+        if ($user->isSalesman()) {
+            // Order today's route customers first
+            $todayRouteId = $user->getTodayRouteId();
+            if ($todayRouteId) {
+                $query->orderByRaw("CASE WHEN route_id = ? THEN 0 ELSE 1 END", [$todayRouteId]);
+            }
+        }
+
+        // دانانی بەشەکان بەپێی per_page (یان ٢٠ بە دیفۆڵت)
+        $perPage = !empty($filters['per_page']) ? (int)$filters['per_page'] : 20;
+        if ($perPage <= 0 || $perPage > 500) {
+            $perPage = 20;
+        }
+        return $query->paginate($perPage);
+    }
+
+    public function createCustomer(array $data, int $userId): Customer
+    {
+        $customer = DB::transaction(function () use ($data, $userId) {
+            $data['created_by'] = $userId;
+
+            $initialDebt = !empty($data['initial_debt']) ? (int)$data['initial_debt'] : 0;
+            unset($data['initial_debt']);
+
+            if (empty($data['route_id'])) {
+                $defaultRoute = \App\Models\Route::firstOrCreate(
+                    ['name' => 'گشتی'],
+                    ['color' => '#888888', 'is_active' => true]
+                );
+                $data['route_id'] = $defaultRoute->id;
+            }
+
+            $data['current_balance'] = $initialDebt;
+
+            $customer = Customer::create($data);
+
+            if ($initialDebt > 0) {
+                \App\Models\CustomerLedger::create([
+                    'customer_id' => $customer->id,
+                    'entry_type' => 'ADJUSTMENT',
+                    'type' => 'debit',
+                    'debit' => $initialDebt,
+                    'credit' => 0,
+                    'amount' => $initialDebt,
+                    'balance_before' => 0,
+                    'balance_after' => $initialDebt,
+                    'description' => 'قەرزی پێشینە / قەرزی سەرەتا',
+                    'created_by' => $userId,
+                ]);
+            }
+
+            event(new \App\Events\CustomerAccountUpdated($customer, 'create'));
+
+            return $customer;
+        });
+
+        // Notify new customer created AFTER database commit (NOT-013)
+        try {
+            $actor = \App\Models\User::find($userId);
+            app(\App\Services\NotificationService::class)->notifyNewCustomerCreated($customer, $actor);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning("Notification dispatch failed for new customer: " . $e->getMessage());
+        }
+
+        return $customer;
+    }
+
+    public function updateCustomer(Customer $customer, array $data): Customer
+    {
+        if (empty($data['route_id']) && !$customer->route_id) {
+            $defaultRoute = \App\Models\Route::firstOrCreate(
+                ['name' => 'گشتی'],
+                ['color' => '#888888', 'is_active' => true]
+            );
+            $data['route_id'] = $defaultRoute->id;
+        }
+        $customer->update($data);
+        
+        $updated = $customer->fresh();
+        event(new \App\Events\CustomerAccountUpdated($updated, 'update'));
+        
+        return $updated;
+    }
+
+    public function deleteCustomer(Customer $customer): bool
+    {
+        $customerId = $customer->id;
+        $deleted = $customer->delete();
+        
+        if ($deleted) {
+            event(new \App\Events\CustomerAccountUpdated(null, 'delete', $customerId));
+        }
+        
+        return $deleted;
+    }
+}

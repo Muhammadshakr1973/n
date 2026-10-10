@@ -1,0 +1,13 @@
+{
+  "name": "pos_app",
+  "version": "1.0.0",
+  "description": "POS Application",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "build": "node -e \"console.log('GARDI ERP Build Ready')\"",
+    "start": "node server.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

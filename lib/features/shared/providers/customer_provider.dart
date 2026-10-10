@@ -1,0 +1,466 @@
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../core/api_client.dart';
+import '../../../core/sync/pusher_service.dart';
+import '../../../core/models/paginated_response.dart';
+import '../../admin/views/providers/dashboard_provider.dart';
+import '../../auth/providers/auth_provider.dart';
+import '../../salesman/providers/salesman_dashboard_provider.dart';
+import '../models/customer.dart';
+import '../models/customer_ledger_model.dart';
+import '../models/customer_reconciliation_model.dart';
+
+class CustomerFilters {
+  final int page;
+  final int? routeId;
+  final bool onlyDebtors;
+  final String searchQuery;
+  final int? perPage;
+
+  const CustomerFilters({
+    this.page = 1,
+    this.routeId,
+    this.onlyDebtors = false,
+    this.searchQuery = '',
+    this.perPage,
+  });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'page': page,
+      if (routeId != null) 'route_id': routeId,
+      if (onlyDebtors) 'has_debt': 'true',
+      if (searchQuery.isNotEmpty) 'search': searchQuery,
+      if (perPage != null) 'per_page': perPage,
+    };
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is CustomerFilters &&
+        other.page == page &&
+        other.routeId == routeId &&
+        other.onlyDebtors == onlyDebtors &&
+        other.searchQuery == searchQuery &&
+        other.perPage == perPage;
+  }
+
+  @override
+  int get hashCode => Object.hash(page, routeId, onlyDebtors, searchQuery, perPage);
+}
+
+final filteredCustomerListProvider =
+    FutureProvider.family<PaginatedResponse<Customer>, CustomerFilters>((
+      ref,
+      filters,
+    ) async {
+      final userId = ref.watch(authProvider.select((state) => state.user?.id));
+      if (userId == null) {
+        return PaginatedResponse<Customer>(
+          data: const [],
+          currentPage: 1,
+          lastPage: 1,
+          total: 0,
+          perPage: 15,
+        );
+      }
+      final api = ref.watch(apiClientProvider);
+      final pusher = ref.watch(pusherServiceProvider);
+
+      void onCustomerEvent(Map<String, dynamic> eventData) {
+        debugPrint("Realtime update received on private-customers channel: $eventData");
+        ref.invalidateSelf();
+      }
+
+      pusher.subscribeToChannel('private-customers', onCustomerEvent);
+
+      ref.onDispose(() {
+        pusher.unsubscribeFromChannel('private-customers', onCustomerEvent);
+      });
+
+      try {
+        final response = await api.client.get(
+          '/customers',
+          queryParameters: filters.toMap(),
+        );
+        if (response.statusCode == 200) {
+          final resData = response.data;
+          if (resData is! Map) {
+            throw FormatException(
+              'داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed customer response payload)',
+            );
+          }
+          var rawData = resData['data'];
+          if (rawData is Map) {
+            return PaginatedResponse<Customer>.fromJson(rawData as Map<String, dynamic>, (json) => Customer.fromJson(json));
+          } else if (rawData is List) {
+            return PaginatedResponse<Customer>(
+              data: rawData.map((json) => Customer.fromJson(json)).toList(),
+              currentPage: 1,
+              lastPage: 1,
+              total: rawData.length,
+              perPage: rawData.length,
+            );
+          } else {
+            throw FormatException(
+              'داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed customer list structure)',
+            );
+          }
+        }
+        throw Exception(
+          'سێرڤەر کۆدی نادروستی گەڕاندەوە (Server returned invalid code): ${response.statusCode}',
+        );
+      } catch (e) {
+        throw Exception(api.parseError(e));
+      }
+    });
+
+final customerListProvider = FutureProvider<List<Customer>>((ref) {
+  final paginatedAsync = ref.watch(
+    filteredCustomerListProvider(const CustomerFilters(perPage: 500)),
+  );
+  return paginatedAsync.when(
+    data: (paginated) => paginated.data,
+    loading: () => Completer<List<Customer>>().future,
+    error: (err, stack) => Future<List<Customer>>.error(err, stack),
+  );
+});
+
+final singleCustomerProvider = FutureProvider.family<Customer, int>((
+  ref,
+  id,
+) async {
+  final userId = ref.watch(authProvider.select((state) => state.user?.id));
+  if (userId == null) {
+    throw Exception('بەکارهێنەر چۆتە دەرەوە (User is logged out)');
+  }
+  final api = ref.watch(apiClientProvider);
+  final pusher = ref.watch(pusherServiceProvider);
+
+  void onSingleCustomerEvent(Map<String, dynamic> eventData) {
+    debugPrint("Realtime update received on private-customers channel for singleCustomer: $eventData");
+    ref.invalidateSelf();
+  }
+
+  pusher.subscribeToChannel('private-customers', onSingleCustomerEvent);
+
+  ref.onDispose(() {
+    pusher.unsubscribeFromChannel('private-customers', onSingleCustomerEvent);
+  });
+
+  try {
+    final response = await api.client.get('/customers/$id');
+    if (response.statusCode == 200) {
+      final resData = response.data;
+      if (resData is! Map || resData['data'] is! Map) {
+        throw FormatException(
+          'داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed customer detail payload)',
+        );
+      }
+      return Customer.fromJson(Map<String, dynamic>.from(resData['data']));
+    }
+    throw Exception('Failed to load customer');
+  } catch (e) {
+    throw Exception(api.parseError(e));
+  }
+});
+
+final customerReconciliationProvider =
+    FutureProvider.family<CustomerReconciliationModel, int>((ref, id) async {
+      final userId = ref.watch(authProvider.select((state) => state.user?.id));
+      if (userId == null) {
+        throw Exception('بەکارهێنەر چۆتە دەرەوە (User is logged out)');
+      }
+      final api = ref.watch(apiClientProvider);
+      try {
+        final response = await api.client.get('/customers/$id/reconcile');
+        if (response.statusCode == 200) {
+          final resData = response.data;
+          if (resData is! Map || resData['data'] is! Map) {
+            throw FormatException(
+              'داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed reconciliation response)',
+            );
+          }
+          return CustomerReconciliationModel.fromJson(
+            Map<String, dynamic>.from(resData['data']),
+          );
+        }
+        throw Exception('Failed to fetch reconciliation report');
+      } catch (e) {
+        throw Exception(api.parseError(e));
+      }
+    });
+
+final customerLedgerProvider =
+    FutureProvider.family<List<CustomerLedgerModel>, Map<String, dynamic>>((
+      ref,
+      filters,
+    ) async {
+      final userId = ref.watch(authProvider.select((state) => state.user?.id));
+      if (userId == null) return const [];
+      final api = ref.watch(apiClientProvider);
+      final pusher = ref.watch(pusherServiceProvider);
+      final customerId = filters['customer_id'];
+
+      void onLedgerEvent(Map<String, dynamic> eventData) {
+        debugPrint("Realtime update received on private-customers or private-orders for ledger: $eventData");
+        ref.invalidateSelf();
+      }
+
+      pusher.subscribeToChannel('private-customers', onLedgerEvent);
+      pusher.subscribeToChannel('private-orders', onLedgerEvent);
+
+      ref.onDispose(() {
+        pusher.unsubscribeFromChannel('private-customers', onLedgerEvent);
+        pusher.unsubscribeFromChannel('private-orders', onLedgerEvent);
+      });
+
+      try {
+        final response = await api.client.get(
+          '/customers/$customerId/ledger',
+          queryParameters: filters,
+        );
+        if (response.statusCode == 200) {
+          final resData = response.data;
+          if (resData is! Map || resData['data'] is! List) {
+            throw FormatException(
+              'داتای وەڵامدانەوەی سێرڤەر نادروستە (Malformed customer ledger response payload)',
+            );
+          }
+          final List data = resData['data'] as List;
+          return data
+              .map((json) => CustomerLedgerModel.fromJson(json))
+              .toList();
+        }
+        throw Exception(
+          'سێرڤەر کۆدی نادروستی گەڕاندەوە (Server returned invalid code): ${response.statusCode}',
+        );
+      } catch (e) {
+        throw Exception(api.parseError(e));
+      }
+    });
+
+final customerActionsProvider = Provider<CustomerActions>((ref) {
+  final api = ref.watch(apiClientProvider);
+  return CustomerActions(api, ref);
+});
+
+class CustomerActions {
+  final ApiClient api;
+  final Ref ref;
+
+  CustomerActions(this.api, this.ref);
+
+  Future<Customer> addCustomer({
+    required String name,
+    String? phone,
+    String? customerName,
+    String? address,
+    String? imageUrl,
+    int? routeId,
+    String? priceType,
+    int? initialDebt,
+    double? latitude,
+    double? longitude,
+  }) async {
+    final payload = {
+      'name': name,
+      if (phone != null && phone.isNotEmpty) 'phone': phone,
+      if (customerName != null && customerName.isNotEmpty) 'customer_name': customerName,
+      if (address != null && address.isNotEmpty) 'address': address,
+      if (imageUrl != null && imageUrl.trim().isNotEmpty) 'image_url': imageUrl.trim(),
+      if (routeId != null) 'route_id': routeId,
+      if (priceType != null) 'price_type': priceType,
+      if (initialDebt != null && initialDebt > 0) 'initial_debt': initialDebt,
+      if (latitude != null) 'latitude': latitude,
+      if (longitude != null) 'longitude': longitude,
+    };
+
+    try {
+      final response = await api.client.post('/customers', data: payload);
+      if (response.statusCode != null && response.statusCode! >= 400) {
+        throw Exception(api.extractErrorMessage(response.data, defaultMsg: 'کێشەیەک لە زانیارییەکاندا هەیە'));
+      }
+      final resData = response.data;
+      if (resData is Map && resData['data'] is Map) {
+        final createdCustomer = Customer.fromJson(Map<String, dynamic>.from(resData['data']));
+        ref.invalidate(customerListProvider);
+        ref.invalidate(filteredCustomerListProvider);
+        ref.invalidate(salesmanDashboardProvider);
+        return createdCustomer;
+      }
+      throw FormatException('داتای دروستکراوی کڕیار نادروستە');
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<Customer> updateCustomer(
+    int id, {
+    required String name,
+    String? phone,
+    String? customerName,
+    String? address,
+    String? imageUrl,
+    int? routeId,
+    String? priceType,
+    bool? isActive,
+    double? latitude,
+    double? longitude,
+  }) async {
+    final payload = {
+      'name': name,
+      if (phone != null && phone.isNotEmpty) 'phone': phone,
+      if (customerName != null && customerName.isNotEmpty) 'customer_name': customerName,
+      if (address != null && address.isNotEmpty) 'address': address,
+      'image_url': (imageUrl != null && imageUrl.trim().isNotEmpty) ? imageUrl.trim() : null,
+      if (routeId != null) 'route_id': routeId,
+      if (priceType != null) 'price_type': priceType,
+      if (isActive != null) 'is_active': isActive,
+      if (latitude != null) 'latitude': latitude,
+      if (longitude != null) 'longitude': longitude,
+    };
+
+    try {
+      final response = await api.client.put('/customers/$id', data: payload);
+      if (response.statusCode != null && response.statusCode! >= 400) {
+        throw Exception(api.extractErrorMessage(response.data, defaultMsg: 'کێشەیەک لە زانیارییەکاندا هەیە'));
+      }
+      final resData = response.data;
+      if (resData is Map && resData['data'] is Map) {
+        final updatedCustomer = Customer.fromJson(Map<String, dynamic>.from(resData['data']));
+        ref.invalidate(customerListProvider);
+        ref.invalidate(filteredCustomerListProvider);
+        ref.invalidate(singleCustomerProvider(id));
+        ref.invalidate(salesmanDashboardProvider);
+        return updatedCustomer;
+      }
+      throw FormatException('داتای نوێکراوەی کڕیار نادروستە');
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<void> deleteCustomer(int id) async {
+    try {
+      await api.client.delete('/customers/$id');
+      ref.invalidate(customerListProvider);
+      ref.invalidate(filteredCustomerListProvider);
+      ref.invalidate(singleCustomerProvider(id));
+      ref.invalidate(salesmanDashboardProvider);
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<CustomerReconciliationModel> fixCustomerBalance(int id) async {
+    try {
+      final response = await api.client.post(
+        '/customers/$id/reconcile',
+        data: {'fix': true},
+      );
+      if (response.statusCode == 200) {
+        final resData = response.data;
+        if (resData is! Map || resData['data'] is! Map) {
+          throw const FormatException('Malformed response from server');
+        }
+
+        final result = CustomerReconciliationModel.fromJson(
+          Map<String, dynamic>.from(resData['data']),
+        );
+
+        // Invalidate providers to force refresh
+        ref.invalidate(singleCustomerProvider(id));
+        ref.invalidate(customerReconciliationProvider(id));
+        ref.invalidate(customerListProvider);
+        ref.invalidate(filteredCustomerListProvider);
+        ref.invalidate(salesmanDashboardProvider);
+
+        return result;
+      } else {
+        throw Exception('Failed to fix customer balance');
+      }
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<Map<int, double>> fetchSpecialPrices(int customerId) async {
+    try {
+      final response = await api.client.get('/customers/$customerId/special-prices');
+      if (response.statusCode == 200) {
+        final resData = response.data;
+        final map = <int, double>{};
+        if (resData is Map && resData['data'] is List) {
+          for (final item in resData['data']) {
+            final productId = item['product_id'] as int?;
+            final price = double.tryParse(item['price']?.toString() ?? '0') ?? 0.0;
+            if (productId != null) {
+              map[productId] = price;
+            }
+          }
+        }
+        return map;
+      }
+      return {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  Future<void> setSpecialPrice(int customerId, int productId, double price) async {
+    try {
+      await api.client.post(
+        '/customers/$customerId/special-prices',
+        data: {
+          'product_id': productId,
+          'price': price.toInt(),
+        },
+      );
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<void> createPayment({
+    required int customerId,
+    required int amount,
+    int? salesOrderId,
+    String? paymentMethod = 'CASH',
+    String? notes,
+  }) async {
+    final payload = {
+      'customer_id': customerId,
+      'amount': amount,
+      if (salesOrderId != null) 'sales_order_id': salesOrderId,
+      if (paymentMethod != null) 'payment_method': paymentMethod,
+      if (notes != null && notes.isNotEmpty) 'notes': notes,
+    };
+
+    try {
+      final response = await api.client.post('/payments', data: payload);
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        ref.invalidate(customerListProvider);
+        ref.invalidate(filteredCustomerListProvider);
+        ref.invalidate(singleCustomerProvider(customerId));
+        ref.invalidate(salesmanDashboardProvider);
+        ref.invalidate(dashboardProvider);
+        return;
+      }
+      throw FormatException('داتای وەڵامدانەوەی سێرڤەر نادروستە');
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+
+  Future<void> deleteSpecialPrice(int customerId, int productId) async {
+    try {
+      await api.client.delete('/customers/$customerId/special-prices/$productId');
+    } catch (e) {
+      throw Exception(api.parseError(e));
+    }
+  }
+}
